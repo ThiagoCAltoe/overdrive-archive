@@ -73,19 +73,49 @@ available.
 
 ## Capacity and retention
 
-This release does not automatically delete archived files and does not enforce a
-total archive quota. `ARCHIVE_MAX_RECORDING_GB` is a safety limit for one
-download, not a storage budget.
+Local retention is disabled by default. The web settings provide independent
+age policies for recordings, trips, charging, automations, key mappings,
+telemetry, RoadSense, and sanitized configuration. Each rule accepts minutes,
+hours, or days and can protect the newest configured number of items. Age uses
+the original source timestamp when available, with local archive time as the
+fallback. Saving settings applies enabled rules immediately to local files.
 
-Monitor free space for both:
+An optional global archive-size limit is also available. The interface reads
+the mounted filesystem capacity and does not offer a larger value. With the
+limit disabled, the application does not impose a quota and may use the entire
+available filesystem. `ARCHIVE_MAX_RECORDING_GB` remains a separate safety
+limit for one incoming recording.
+
+When a policy applies, the application deletes only local primary content and
+known sidecars, including resumable partials. For recordings it keeps a
+zero-byte **Deleted locally** placeholder while the vehicle still reports the
+original. The placeholder blocks automatic redownload and offers **Download
+again**. A restored file is pinned against automatic retention until **Use
+retention rules** removes that pin; current rules may then apply immediately.
+
+The primary-file transition uses a durable SQLite cleanup journal. Startup
+restores a staged file when its inventory row is still authoritative, or
+finishes local cleanup when the tombstone was already committed. This covers
+process and container interruption; physical power-loss durability depends on
+the mounted filesystem and storage appliance.
+
+The placeholder is removed only after a complete, internally consistent remote
+listing confirms that the recording left the vehicle. Failed, partial, timed-out,
+or cancelled listings never purge it. The application never calls a deletion
+endpoint on the vehicle. Protected newest or manually restored items are not
+removed to satisfy the global limit. Save responses and synchronization details
+report when protected or unmanaged files prevent the configured target from
+being reached.
+
+Continue monitoring free space for both:
 
 - `ARCHIVE_DATA_PATH`, which contains SQLite and authentication state;
-- `ARCHIVE_HOST_PATH`, which contains recordings and JSON exports.
+- `ARCHIVE_HOST_PATH`, which contains recordings, JSON exports, resumable
+  partials, and sidecars.
 
-Use NAS snapshots, filesystem quotas, or external retention tooling until the
-planned application retention policies are available. If the archive volume is
-full, a synchronization can finish as partial or failed; existing archived
-files are not deleted to make room.
+Filesystem or NAS snapshots remain recommended because retention is not a
+backup. If the archive volume fills before cleanup can run, a synchronization
+can still finish as partial or failed.
 
 ## Recommended NAS setup
 

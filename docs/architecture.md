@@ -28,7 +28,12 @@ and recording timestamp. Expected size is deliberately not part of that
 identity, so corrected size metadata does not create a duplicate item. JSON
 snapshots are keyed by their SHA-256 digest. Downloads are streamed into a
 `.part` file, hashed, flushed, and atomically renamed before being added to the
-SQLite inventory.
+SQLite inventory. A small durable completion proof binds the source identity,
+byte count, and SHA-256 digest until the inventory and optional sidecars are
+committed. If the vehicle removes a recording during that window, the next run
+can validate and inventory the completed local bytes instead of discarding the
+only copy; ambiguous partial data is retained for inspection rather than
+inventoried as a recording.
 
 Recording types are normalized into archive subtypes such as `drive`, `replay`,
 `surveillance`, `proximity`, and `oem_dashcam`. Overdrive PR #150-era replay

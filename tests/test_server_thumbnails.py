@@ -28,12 +28,11 @@ class _Database:
             None,
         )
 
-    def list_items(self, **_filters) -> list[dict]:
-        return [dict(item) for item in self.items]
+    def list_library_items(self, *, limit=100, offset=0, **_filters) -> list[dict]:
+        return [dict(item) for item in self.items][offset : offset + limit]
 
     def recording_subtypes(self) -> list[dict]:
         return []
-
 
 class ThumbnailServerTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -175,6 +174,23 @@ class ThumbnailServerTests(unittest.TestCase):
             all("metadata_json" not in item for item in payload["items"])
         )
         self.assertNotIn(b"must-not-leak", body)
+
+    def test_items_endpoint_exposes_every_page_without_a_fixed_cap(self) -> None:
+        status, _headers, first_body = self._request("/api/items?limit=1")
+        self.assertEqual(status, 200)
+        first = json.loads(first_body)
+        self.assertEqual([item["id"] for item in first["items"]], [1])
+        self.assertTrue(first["has_more"])
+        self.assertEqual(first["next_offset"], 1)
+
+        status, _headers, second_body = self._request(
+            f"/api/items?limit=1&offset={first['next_offset']}"
+        )
+        self.assertEqual(status, 200)
+        second = json.loads(second_body)
+        self.assertEqual([item["id"] for item in second["items"]], [2])
+        self.assertFalse(second["has_more"])
+        self.assertIsNone(second["next_offset"])
 
     def test_missing_thumbnail_returns_not_found(self) -> None:
         status, _headers, body = self._request("/thumbnail/2")

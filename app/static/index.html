@@ -77,6 +77,13 @@
           <h1 id="page-title">Overview</h1>
         </div>
         <div class="topbar-actions">
+          <div id="sync-progress" class="sync-progress hidden" role="progressbar" aria-label="Synchronization progress">
+            <div class="sync-progress-copy">
+              <strong id="sync-progress-value">Synchronizing…</strong>
+              <span id="sync-progress-detail"></span>
+            </div>
+            <div class="sync-progress-track" aria-hidden="true"><i id="sync-progress-bar"></i></div>
+          </div>
           <div id="sync-chip" class="status-chip"><span></span><strong>Idle</strong></div>
           <button id="sync-now-top" class="button primary" type="button">Sync now</button>
         </div>
@@ -157,7 +164,7 @@
               <label class="field compact"><span>Category</span>
                 <select id="library-category">
                   <option value="">All categories</option>
-                  <option value="recordings">Recordings</option>
+                  <option value="recordings" selected>Recordings</option>
                   <option value="trips">Trips</option>
                   <option value="charging">Charging</option>
                   <option value="automations">Automations</option>
@@ -184,10 +191,13 @@
                 <p class="eyebrow">VISUAL ARCHIVE</p>
                 <h3 id="library-summary">Loading archived items…</h3>
               </div>
-              <span class="library-view-note"><i></i> Private previews from your archive</span>
+              <span class="library-view-note"><i></i><span id="library-view-note-copy">Private previews from your archive</span></span>
             </div>
             <div id="library-grid" class="archive-grid" aria-live="polite" aria-busy="true"></div>
             <div id="library-empty" class="empty-state hidden">No archived items match these filters.</div>
+            <div class="library-pagination">
+              <button id="library-load-more" class="button secondary hidden" type="button">Load more</button>
+            </div>
           </article>
         </section>
 
@@ -218,12 +228,14 @@
               <div class="form-grid">
                 <label class="field"><span>Vehicle name</span><input id="vehicle-name" maxlength="80" required placeholder="My vehicle"></label>
                 <label class="field"><span>Overdrive URL</span><input id="vehicle-url" type="url" maxlength="500" placeholder="http://100.x.x.x:8080"></label>
-                <label class="field full"><span>Access code, full token, or bearer JWT</span><input id="vehicle-token" type="password" maxlength="4096" autocomplete="new-password" placeholder="Leave blank to keep the saved credential"><small id="token-state">No credential saved</small></label>
+                <label class="field full"><span>Access code, full token, or bearer JWT</span><input id="vehicle-token" type="password" maxlength="4096" autocomplete="new-password" placeholder="Leave blank to keep the saved credential"><small id="token-state">No credential saved.</small></label>
                 <label class="toggle-row full accent-toggle"><input id="auto-detect-profile" type="checkbox"><span class="toggle"></span><span><strong>Import the available Overdrive profile</strong><small>Refreshes device and version details, and fills empty model fields from Overdrive's selected visual profile. Manual values are preserved.</small></span></label>
                 <label class="field"><span>Vehicle model</span><input id="vehicle-model-name" maxlength="120" placeholder="Imported profile or manual value"></label>
                 <label class="field"><span>Model ID</span><input id="vehicle-model-id" maxlength="80" placeholder="e.g. dolphin, seagull, atto3"></label>
                 <label class="field"><span>Drive side</span><select id="vehicle-drive-side"><option value="">Unknown / automatic</option><option value="lhd">Left-hand drive</option><option value="rhd">Right-hand drive</option></select></label>
                 <label class="field"><span>Vehicle color</span><input id="vehicle-color" maxlength="30" placeholder="#E8E8EC"></label>
+                <label class="field"><span>Recording camera layout</span><select id="recording-layout"><option value="">Automatic / standard</option><option value="standard">Standard 2 × 2</option><option value="dashcam">Dashcam mosaic</option></select><small>Used for ACC and Replay recordings when the clip does not report its layout.</small></label>
+                <label class="field"><span>Surveillance camera layout</span><select id="surveillance-layout"><option value="">Automatic / standard</option><option value="standard">Standard 2 × 2</option><option value="dashcam">Dashcam mosaic</option></select><small>Used for Surveillance and Proximity recordings when the clip does not report its layout.</small></label>
                 <label class="field"><span>Detected device ID</span><input id="vehicle-device-id" readonly></label>
                 <label class="field"><span>Detected Overdrive version</span><input id="vehicle-app-version" readonly></label>
                 <label class="toggle-row full"><input id="verify-tls" type="checkbox"><span class="toggle"></span><span><strong>Verify TLS certificates</strong><small>Keep enabled for HTTPS. Disable only for a trusted self-signed endpoint.</small></span></label>
@@ -284,6 +296,8 @@
                   <label class="alert"><input type="checkbox" value="ALERT"><span>Alert</span></label>
                   <label class="critical"><input type="checkbox" value="CRITICAL"><span>Critical</span></label>
                 </div>
+                <p class="retention-help">These labels come from Overdrive and filter Surveillance and Proximity recordings. With none selected, severity filtering is disabled; recordings without a reported severity are kept.</p>
+                <p class="retention-help">Notice covers background or passing activity; Alert marks nearby or approaching activity; Critical marks the closest or strongest reported threat. This archive only filters the label reported by Overdrive.</p>
               </fieldset>
               <div class="form-grid">
                 <label class="toggle-row full"><input id="include-thumbnails" type="checkbox"><span class="toggle"></span><span><strong>Download thumbnails</strong><small>Stores the best available preview next to each video.</small></span></label>
@@ -305,7 +319,30 @@
             </article>
 
             <article class="panel settings-card">
-              <div class="settings-title"><span>06</span><div><h3>Authentication</h3><p>The installer chooses which sign-in methods are available. Local password is the default; Telegram and WhatsApp are optional.</p></div></div>
+              <div class="settings-title"><span>06</span><div><h3>Local retention</h3><p>Remove older local archive copies by category and optionally limit total storage usage.</p></div></div>
+              <div class="retention-safety">
+                <strong>Vehicle recordings stay untouched</strong>
+                <span>Retention deletes only local archive copies. It never deletes or changes recordings stored in the vehicle.</span>
+                <span>Saving settings applies enabled retention rules immediately to local files.</span>
+              </div>
+              <fieldset>
+                <legend>Retention by category</legend>
+                <div id="retention-category-options" class="retention-list"></div>
+                <p class="retention-help">Items protected by “Keep the latest” are never deleted by age or by the storage limit.</p>
+                <p class="retention-help">Age uses the original recording time when available, then falls back to the local archive time.</p>
+              </fieldset>
+              <fieldset>
+                <legend>Storage limit</legend>
+                <div class="retention-storage-grid">
+                  <label class="toggle-row accent-toggle"><input id="retention-storage-enabled" type="checkbox"><span class="toggle"></span><span><strong>Limit archive storage usage</strong><small>When disabled, the archive may use the whole available filesystem.</small></span></label>
+                  <label class="field"><span>Maximum archive size (GB)</span><input id="retention-storage-gb" type="number" min="0.001" step="0.001" inputmode="decimal"></label>
+                </div>
+                <p id="retention-storage-capacity" class="retention-help">Archive filesystem capacity is not available yet.</p>
+              </fieldset>
+            </article>
+
+            <article class="panel settings-card">
+              <div class="settings-title"><span>07</span><div><h3>Authentication</h3><p>The installer chooses which sign-in methods are available. Local password is the default; Telegram and WhatsApp are optional.</p></div></div>
               <div id="auth-method-summary" class="auth-summary"></div>
               <div class="roadmap-note"><strong>Provider configuration</strong><span>Provider secrets are supplied through Docker environment variables or secrets, so bot tokens never appear in the browser or public repository.</span></div>
             </article>

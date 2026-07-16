@@ -86,7 +86,9 @@ const PT_BR_TEXT = {
   'VISUAL ARCHIVE': 'ARQUIVO VISUAL',
   'Loading archived items…': 'Carregando itens arquivados…',
   'Private previews from your archive': 'Miniaturas privadas do seu arquivo',
+  'Stored media and metadata-only placeholders': 'Mídia armazenada e marcadores somente com metadados',
   'No archived items match these filters.': 'Nenhum item arquivado corresponde a estes filtros.',
+  'Load more': 'Carregar mais',
   'SYNC POLICY': 'POLÍTICA DE SINCRONIZAÇÃO',
   'Every policy is configurable. Nothing here changes the current Overdrive configuration in your vehicle.': 'Todas as políticas são configuráveis. Nada aqui altera a configuração atual do Overdrive no veículo.',
   'Save & test connection': 'Salvar e testar conexão',
@@ -109,6 +111,13 @@ const PT_BR_TEXT = {
   'Left-hand drive': 'Volante à esquerda',
   'Right-hand drive': 'Volante à direita',
   'Vehicle color': 'Cor do veículo',
+  'Recording camera layout': 'Layout das câmeras de gravação',
+  'Surveillance camera layout': 'Layout das câmeras de vigilância',
+  'Automatic / standard': 'Automático / padrão',
+  'Standard 2 × 2': 'Padrão 2 × 2',
+  'Dashcam mosaic': 'Mosaico dashcam',
+  'Used for ACC and Replay recordings when the clip does not report its layout.': 'Usado para gravações ACC e Replay quando o vídeo não informa o próprio layout.',
+  'Used for Surveillance and Proximity recordings when the clip does not report its layout.': 'Usado para gravações de Vigilância e Proximidade quando o vídeo não informa o próprio layout.',
   'Detected device ID': 'ID do dispositivo detectado',
   'Detected Overdrive version': 'Versão detectada do Overdrive',
   'Verify TLS certificates': 'Verificar certificados TLS',
@@ -148,7 +157,31 @@ const PT_BR_TEXT = {
   'Instant replay': 'Replay instantâneo',
   'Automatically include new recording types': 'Incluir automaticamente novos tipos de gravação',
   'Preserves and tags recording types introduced by future Overdrive releases, even before this archive UI knows their friendly name.': 'Preserva e identifica tipos introduzidos por futuras versões do Overdrive, mesmo antes de esta interface conhecer o nome amigável.',
+  'Local retention': 'Retenção local',
+  'Remove older local archive copies by category and optionally limit total storage usage.': 'Remova cópias locais antigas por categoria e, opcionalmente, limite o uso total do armazenamento.',
+  'Vehicle recordings stay untouched': 'As gravações do veículo permanecem intactas',
+  'Retention deletes only local archive copies. It never deletes or changes recordings stored in the vehicle.': 'A retenção apaga somente cópias do arquivo local. Ela nunca apaga nem altera as gravações armazenadas no veículo.',
+  'Saving settings applies enabled retention rules immediately to local files.': 'Salvar as configurações aplica imediatamente aos arquivos locais as regras de retenção ativadas.',
+  'Retention by category': 'Retenção por categoria',
+  'Items protected by “Keep the latest” are never deleted by age or by the storage limit.': 'Os itens protegidos por “Manter os mais recentes” nunca são apagados por prazo nem pelo limite de armazenamento.',
+  'Age uses the original recording time when available, then falls back to the local archive time.': 'O prazo usa a data original da gravação quando disponível e, como alternativa, a data do arquivo local.',
+  'Storage limit': 'Limite de armazenamento',
+  'Limit archive storage usage': 'Limitar o uso do armazenamento pelo arquivo',
+  'When disabled, the archive may use the whole available filesystem.': 'Quando desativado, o arquivo pode usar todo o espaço disponível no sistema de arquivos.',
+  'Maximum archive size (GB)': 'Tamanho máximo do arquivo (GB)',
+  'Archive filesystem capacity is not available yet.': 'A capacidade do sistema de arquivos ainda não está disponível.',
+  'Local copies only': 'Somente cópias locais',
+  'Delete local copies older than': 'Apagar cópias locais com mais de',
+  'Retention value': 'Valor da retenção',
+  'Retention unit': 'Unidade da retenção',
+  'Keep the latest': 'Manter os mais recentes',
+  'Protected item count': 'Quantidade de itens protegidos',
+  'Archive filesystem capacity': 'Capacidade do sistema de arquivos',
+  'The storage limit is disabled.': 'O limite de armazenamento está desativado.',
+  'The configured storage limit is active.': 'O limite de armazenamento configurado está ativo.',
   'Surveillance severity': 'Severidade da vigilância',
+  'These labels come from Overdrive and filter Surveillance and Proximity recordings. With none selected, severity filtering is disabled; recordings without a reported severity are kept.': 'Esses rótulos vêm do Overdrive e filtram gravações de Vigilância e Proximidade. Sem nenhuma opção marcada, o filtro de severidade fica desativado; gravações sem severidade informada são mantidas.',
+  'Notice covers background or passing activity; Alert marks nearby or approaching activity; Critical marks the closest or strongest reported threat. This archive only filters the label reported by Overdrive.': 'Aviso cobre atividade de fundo ou de passagem; Alerta marca atividade próxima ou se aproximando; Crítico marca a ameaça mais próxima ou mais forte informada. Este arquivo apenas filtra o rótulo informado pelo Overdrive.',
   'Notice': 'Aviso',
   'Alert': 'Alerta',
   'Critical': 'Crítico',
@@ -210,6 +243,9 @@ const PT_BR_TEXT = {
   'Settings loaded.': 'Configurações carregadas.',
   'Settings saved.': 'Configurações salvas.',
   'Settings saved': 'Configurações salvas',
+  'Retention will run after the current synchronization.': 'A retenção será executada após a sincronização atual.',
+  'The storage target could not be reached because the remaining data is protected or unmanaged.': 'Não foi possível atingir o limite de armazenamento porque os dados restantes estão protegidos ou não são gerenciados.',
+  'Retention could not remove some local items.': 'A retenção não conseguiu remover alguns itens locais.',
   'Enabled': 'Ativado',
   'No authentication method is configured.': 'Nenhum método de autenticação está configurado.',
   'Testing…': 'Testando…',
@@ -221,10 +257,38 @@ const PT_BR_TEXT = {
   'Synchronization started': 'Sincronização iniciada',
   'Synchronizing': 'Sincronizando',
   'Synchronizing…': 'Sincronizando…',
+  'Synchronization progress': 'Progresso da sincronização',
+  'Stop synchronization': 'Parar sincronização',
+  'Stopping…': 'Parando…',
+  'Stop requested.': 'Parada solicitada.',
+  'Synchronization stop requested.': 'Parada da sincronização solicitada.',
+  'No synchronization is running.': 'Nenhuma sincronização está em execução.',
+  'Synchronization stopped by user.': 'Sincronização interrompida pelo usuário.',
+  'Known bytes': 'Bytes conhecidos',
+  'Size unavailable for': 'Tamanho indisponível para',
+  'queued item': 'item na fila',
+  'queued items': 'itens na fila',
   'Play recording': 'Reproduzir gravação',
   'Download': 'Baixar',
   'Open file': 'Abrir arquivo',
   'No archived items found': 'Nenhum item arquivado encontrado',
+  'Deleted locally': 'Apagado localmente',
+  'Download again': 'Baixar novamente',
+  'Restore queued': 'Restauração na fila',
+  'Local cleanup pending': 'Limpeza local pendente',
+  'Requesting…': 'Solicitando…',
+  '0 B stored': '0 B armazenados',
+  'on vehicle': 'no veículo',
+  'Only metadata is kept. This placeholder disappears after a complete vehicle listing confirms the recording is no longer on the vehicle.': 'Somente os metadados são mantidos. Este marcador desaparece depois que uma listagem completa do veículo confirma que a gravação não está mais nele.',
+  'Synchronization started to download the recording again.': 'A sincronização foi iniciada para baixar a gravação novamente.',
+  'Restore queued for the next synchronization.': 'Restauração colocada na fila para a próxima sincronização.',
+  'Local retention cleanup is still in progress. Try again shortly.': 'A limpeza da retenção local ainda está em andamento. Tente novamente em instantes.',
+  'Protected from retention': 'Protegido contra retenção',
+  'Use retention rules': 'Usar regras de retenção',
+  'This removes the manual protection. Current retention rules may delete the local copy immediately. Continue?': 'Isso remove a proteção manual. As regras atuais de retenção podem apagar a cópia local imediatamente. Continuar?',
+  'Releasing…': 'Liberando…',
+  'Automatic retention is enabled again for this recording.': 'A retenção automática foi reativada para esta gravação.',
+  'The current retention rules removed the local copy.': 'As regras atuais de retenção removeram a cópia local.',
   'Connected': 'Conectado',
   'Play': 'Reproduzir',
   'Open': 'Abrir',
@@ -237,12 +301,19 @@ const PT_BR_TEXT = {
   'active categories': 'categorias ativas',
   'archived item': 'item arquivado',
   'archived items': 'itens arquivados',
+  'item deleted locally': 'item apagado localmente',
+  'items deleted locally': 'itens apagados localmente',
+  'stored': 'armazenados',
   'new': 'novos',
   'success': 'sucesso',
   'failed': 'falhou',
   'partial': 'parcial',
   'skipped': 'ignorado',
   'running': 'em execução',
+  'cancelled': 'cancelada',
+  'item': 'item',
+  'items': 'itens',
+  'transferred': 'transferidos',
   'manual': 'manual',
   'schedule': 'agendamento',
   'sample import': 'importação de amostra',
@@ -265,6 +336,10 @@ const state = {
   language: ['en', 'pt-BR'].includes(savedLanguage()) ? savedLanguage() : 'en',
   lastOverview: null,
   lastLibraryItems: null,
+  libraryRequestId: 0,
+  libraryAbortController: null,
+  libraryNextOffset: 0,
+  libraryHasMore: false,
   playerCameraView: 'all',
   playerCameraLayout: 'standard',
 };
@@ -283,6 +358,19 @@ const playerCameraLabels = {
   rear: 'Rear camera',
   left: 'Left camera',
 };
+
+const RETENTION_CATEGORIES = [
+  ['recordings', 'Recordings'],
+  ['trips', 'Trips'],
+  ['charging', 'Charging'],
+  ['automations', 'Automations'],
+  ['key_mappings', 'Key mappings'],
+  ['telemetry', 'Telemetry'],
+  ['roadsense', 'RoadSense'],
+  ['configuration', 'Configuration'],
+];
+const RETENTION_UNITS = ['minutes', 'hours', 'days'];
+const GIB = 1024 ** 3;
 
 function t(value) {
   return state.language === 'pt-BR' ? (PT_BR_TEXT[value] || value) : value;
@@ -334,6 +422,7 @@ function applyLanguage(language, { rerender = true } = {}) {
   }
   updatePlayerControls();
   updatePlayerTimeline();
+  if ($('retention-storage-capacity')) updateRetentionStorageCapacity();
   if ($('player-dialog').open) announcePlayerCameraView();
   if (!rerender) return;
   if (state.authMethods.length) renderAuthMethods({ methods: state.authMethods });
@@ -484,6 +573,7 @@ function labelFor(value) {
     partial: 'partial',
     skipped: 'skipped',
     running: 'running',
+    cancelled: 'cancelled',
     unknown: 'unknown',
   };
   return t(labels[normalized] || title(normalized));
@@ -507,7 +597,7 @@ function badge(status) {
   return element;
 }
 
-function renderRuns(runs) {
+function renderRuns(runs, sync = {}) {
   const body = $('runs-body');
   body.replaceChildren();
   $('runs-empty').classList.toggle('hidden', runs.length > 0);
@@ -525,10 +615,82 @@ function renderRuns(runs) {
     const transferred = document.createElement('td');
     transferred.textContent = formatBytes(run.bytes_added);
     const details = document.createElement('td');
-    details.textContent = run.message || '—';
+    const detailCopy = document.createElement('span');
+    detailCopy.textContent = run.status === 'cancelled'
+      ? t(run.message || 'Synchronization stopped by user.')
+      : (run.message || '—');
+    details.append(detailCopy);
+    const isCurrentRun = Boolean(sync.active)
+      && run.status === 'running'
+      && String(run.id) === String(sync.run_id);
+    if (isCurrentRun) {
+      details.classList.add('run-details');
+      detailCopy.textContent = t(sync.current || 'Synchronizing…');
+      const stop = document.createElement('button');
+      stop.type = 'button';
+      stop.className = 'button danger small';
+      stop.textContent = t(sync.stop_requested ? 'Stopping…' : 'Stop synchronization');
+      stop.disabled = Boolean(sync.stop_requested);
+      stop.addEventListener('click', () => stopSynchronization(stop));
+      details.append(stop);
+    }
     row.append(started, reason, result, added, transferred, details);
     body.append(row);
   });
+}
+
+function renderSyncProgress(sync) {
+  const progress = $('sync-progress');
+  const active = Boolean(sync.active);
+  progress.classList.toggle('hidden', !active);
+  if (!active) return;
+
+  const done = Math.max(0, Number(sync.queue_bytes_done) || 0);
+  const total = Math.max(0, Number(sync.queue_bytes_total) || 0);
+  const unknownSizes = Math.max(0, Number(sync.queue_unknown_sizes) || 0);
+  const hasUnknownSizes = unknownSizes > 0 || Boolean(sync.queue_bytes_indeterminate);
+  const hasTotal = Number.isFinite(total) && total > 0 && !hasUnknownSizes;
+  const stopping = Boolean(sync.stop_requested);
+  const value = $('sync-progress-value');
+  const bar = $('sync-progress-bar');
+  const parts = [];
+
+  progress.setAttribute('aria-label', t('Synchronization progress'));
+  progress.setAttribute('aria-valuemin', '0');
+  if (hasTotal) {
+    const percent = Math.min(100, Math.max(0, Math.round((done / total) * 100)));
+    value.textContent = stopping ? t('Stopping…') : `${percent}%`;
+    bar.style.width = `${percent}%`;
+    progress.classList.remove('indeterminate');
+    progress.setAttribute('aria-valuemax', '100');
+    progress.setAttribute('aria-valuenow', String(percent));
+    progress.setAttribute('aria-valuetext', `${percent}% · ${formatBytes(done)} / ${formatBytes(total)}`);
+    parts.push(`${formatBytes(done)} / ${formatBytes(total)}`);
+  } else {
+    value.textContent = t(stopping ? 'Stopping…' : 'Synchronizing…');
+    bar.style.width = '';
+    progress.classList.add('indeterminate');
+    progress.removeAttribute('aria-valuemax');
+    progress.removeAttribute('aria-valuenow');
+    progress.setAttribute('aria-valuetext', value.textContent);
+    if (total > 0) parts.push(`${t('Known bytes')}: ${formatBytes(done)} / ${formatBytes(total)}`);
+    else if (done > 0) parts.push(`${formatBytes(done)} ${t('transferred')}`);
+  }
+
+  const itemsDone = Math.max(0, Number(sync.queue_items_done) || 0);
+  const itemsTotal = Math.max(0, Number(sync.queue_items_total) || 0);
+  if (itemsTotal > 0) {
+    parts.push(state.language === 'pt-BR'
+      ? `${itemsDone} de ${itemsTotal} ${t(itemsTotal === 1 ? 'item' : 'items')}`
+      : `${itemsDone} of ${itemsTotal} ${itemsTotal === 1 ? 'item' : 'items'}`);
+  } else if (itemsDone > 0) {
+    parts.push(`${itemsDone} ${t(itemsDone === 1 ? 'item' : 'items')}`);
+  }
+  if (unknownSizes > 0) {
+    parts.push(`${t('Size unavailable for')} ${unknownSizes} ${t(unknownSizes === 1 ? 'queued item' : 'queued items')}`);
+  }
+  if (sync.current) parts.push(t(sync.current));
+  $('sync-progress-detail').textContent = parts.join(' · ');
 }
 
 function renderCategories(categories) {
@@ -575,15 +737,18 @@ function renderOverview(data) {
   $('metric-next-sync').textContent = sync.next_run_at ? relativeTime(sync.next_run_at) : t('Manual');
   $('metric-policy').textContent = state.settings?.schedule?.only_wifi === false ? t('Any network allowed') : t('Wi-Fi policy enabled');
   const active = Boolean(sync.active);
+  renderSyncProgress(sync);
   const chip = $('sync-chip');
   chip.className = `status-chip${active ? ' running' : ''}`;
   chip.querySelector('strong').textContent = active ? t(sync.current || 'Synchronizing') : t('Idle');
+  $('sync-now-top').classList.toggle('hidden', active);
   [$('sync-now-top'), $('sync-now-hero')].forEach(button => {
     button.disabled = active;
     button.textContent = active ? t('Synchronizing…') : t(button.id === 'sync-now-hero' ? 'Start synchronization' : 'Sync now');
   });
-  renderRuns(runs);
+  renderRuns(runs, sync);
   renderCategories(Array.isArray(stats.categories) ? stats.categories : []);
+  updateRetentionStorageCapacity();
   clearTimeout(state.overviewTimer);
   state.overviewTimer = setTimeout(loadOverview, active ? 4000 : 15000);
 }
@@ -609,6 +774,20 @@ async function runSync() {
   }
 }
 
+async function stopSynchronization(button) {
+  button.disabled = true;
+  button.textContent = t('Stopping…');
+  try {
+    const response = await api('/api/sync/stop', { method: 'POST', body: '{}' });
+    toast(t(response.message || 'Stop requested.'));
+    await loadOverview();
+  } catch (error) {
+    button.disabled = false;
+    button.textContent = t('Stop synchronization');
+    toast(t(error.message));
+  }
+}
+
 function selectedValues(containerId) {
   return [...document.querySelectorAll(`#${containerId} input[type="checkbox"]:checked`)].map(input => input.value);
 }
@@ -618,6 +797,194 @@ function setSelected(containerId, values) {
   document.querySelectorAll(`#${containerId} input[type="checkbox"]`).forEach(input => {
     input.checked = selected.has(input.value);
   });
+}
+
+function buildRetentionControls() {
+  const container = $('retention-category-options');
+  container.replaceChildren();
+  RETENTION_CATEGORIES.forEach(([category, label]) => {
+    const row = document.createElement('div');
+    row.className = 'retention-category';
+    row.dataset.retentionCategory = category;
+
+    const heading = document.createElement('div');
+    heading.className = 'retention-category-heading';
+    const name = document.createElement('strong');
+    name.textContent = label;
+    const localOnly = document.createElement('small');
+    localOnly.textContent = 'Local copies only';
+    heading.append(name, localOnly);
+
+    const rules = document.createElement('div');
+    rules.className = 'retention-rules';
+
+    const ageRule = document.createElement('div');
+    ageRule.className = 'retention-rule';
+    const ageToggle = document.createElement('label');
+    ageToggle.className = 'retention-rule-copy';
+    const ageEnabled = document.createElement('input');
+    ageEnabled.id = `retention-${category}-enabled`;
+    ageEnabled.className = 'retention-rule-enabled';
+    ageEnabled.type = 'checkbox';
+    const ageCopy = document.createElement('span');
+    ageCopy.textContent = 'Delete local copies older than';
+    ageToggle.append(ageEnabled, ageCopy);
+    const ageValue = document.createElement('input');
+    ageValue.id = `retention-${category}-value`;
+    ageValue.className = 'retention-rule-value';
+    ageValue.type = 'number';
+    ageValue.min = '1';
+    ageValue.max = '1000000';
+    ageValue.step = '1';
+    ageValue.value = '30';
+    ageValue.inputMode = 'numeric';
+    ageValue.setAttribute('aria-label', 'Retention value');
+    const ageUnit = document.createElement('select');
+    ageUnit.id = `retention-${category}-unit`;
+    ageUnit.className = 'retention-rule-unit';
+    ageUnit.setAttribute('aria-label', 'Retention unit');
+    RETENTION_UNITS.forEach(unit => {
+      const option = document.createElement('option');
+      option.value = unit;
+      option.textContent = unit[0].toUpperCase() + unit.slice(1);
+      ageUnit.append(option);
+    });
+    ageUnit.value = 'days';
+    ageRule.append(ageToggle, ageValue, ageUnit);
+
+    const latestRule = document.createElement('div');
+    latestRule.className = 'retention-rule';
+    const latestToggle = document.createElement('label');
+    latestToggle.className = 'retention-rule-copy';
+    const latestEnabled = document.createElement('input');
+    latestEnabled.id = `retention-${category}-keep-latest-enabled`;
+    latestEnabled.className = 'retention-latest-enabled';
+    latestEnabled.type = 'checkbox';
+    const latestCopy = document.createElement('span');
+    latestCopy.textContent = 'Keep the latest';
+    latestToggle.append(latestEnabled, latestCopy);
+    const latestCount = document.createElement('input');
+    latestCount.id = `retention-${category}-keep-latest-count`;
+    latestCount.className = 'retention-latest-count';
+    latestCount.type = 'number';
+    latestCount.min = '1';
+    latestCount.max = '1000000';
+    latestCount.step = '1';
+    latestCount.value = '1';
+    latestCount.inputMode = 'numeric';
+    latestCount.setAttribute('aria-label', 'Protected item count');
+    const items = document.createElement('span');
+    items.textContent = 'items';
+    latestRule.append(latestToggle, latestCount, items);
+
+    rules.append(ageRule, latestRule);
+    row.append(heading, rules);
+    container.append(row);
+  });
+  updateRetentionControlState();
+}
+
+function updateRetentionControlState() {
+  document.querySelectorAll('[data-retention-category]').forEach(row => {
+    const ageEnabled = row.querySelector('.retention-rule-enabled').checked;
+    row.querySelector('.retention-rule-value').disabled = !ageEnabled;
+    row.querySelector('.retention-rule-unit').disabled = !ageEnabled;
+    const latestEnabled = row.querySelector('.retention-latest-enabled').checked;
+    row.querySelector('.retention-latest-count').disabled = !latestEnabled;
+  });
+  $('retention-storage-gb').disabled = !$('retention-storage-enabled').checked;
+}
+
+function archiveStorageCapacityBytes() {
+  const overview = state.lastOverview || {};
+  const settings = state.settings || {};
+  const candidates = [
+    overview.storage_capacity_bytes,
+    overview.storage?.storage_capacity_bytes,
+    overview.stats?.storage_capacity_bytes,
+    settings.runtime?.storage_capacity_bytes,
+    settings.runtime?.storage?.storage_capacity_bytes,
+    settings.storage?.storage_capacity_bytes,
+  ];
+  const capacity = candidates.map(Number).find(value => Number.isFinite(value) && value > 0);
+  return capacity || 0;
+}
+
+function updateRetentionStorageCapacity({ initializeValue = false, configuredMaxBytes = 0 } = {}) {
+  const input = $('retention-storage-gb');
+  const enabled = $('retention-storage-enabled').checked;
+  const capacity = archiveStorageCapacityBytes();
+  let defaultMaximumGb = 1;
+  if (capacity > 0) {
+    const capacityGb = capacity / GIB;
+    const inputMaximum = Math.floor(capacityGb * 1000) / 1000 || capacityGb;
+    defaultMaximumGb = inputMaximum;
+    input.max = String(inputMaximum);
+    if (initializeValue) {
+      input.value = Number(configuredMaxBytes) > 0
+        ? String(Number((Number(configuredMaxBytes) / GIB).toFixed(3)))
+        : '';
+    }
+  } else {
+    input.removeAttribute('max');
+    if (initializeValue) {
+      input.value = Number(configuredMaxBytes) > 0
+        ? String(Number((Number(configuredMaxBytes) / GIB).toFixed(3)))
+        : '';
+    }
+  }
+  if (enabled && !(Number(input.value) > 0)) input.value = String(defaultMaximumGb);
+  input.disabled = !enabled;
+  input.required = enabled;
+  const capacityText = capacity > 0
+    ? `${t('Archive filesystem capacity')}: ${formatBytes(capacity)}.`
+    : t('Archive filesystem capacity is not available yet.');
+  const policyText = enabled
+    ? t('The configured storage limit is active.')
+    : t('When disabled, the archive may use the whole available filesystem.');
+  $('retention-storage-capacity').textContent = `${capacityText} ${policyText}`;
+}
+
+function populateRetentionSettings(settings) {
+  const retention = settings.retention || {};
+  const categories = retention.categories || {};
+  RETENTION_CATEGORIES.forEach(([category]) => {
+    const policy = categories[category] || {};
+    $(`retention-${category}-enabled`).checked = Boolean(policy.enabled);
+    $(`retention-${category}-value`).value = Number(policy.value) > 0 ? String(policy.value) : '30';
+    $(`retention-${category}-unit`).value = RETENTION_UNITS.includes(policy.unit) ? policy.unit : 'days';
+    $(`retention-${category}-keep-latest-enabled`).checked = Boolean(policy.keep_latest_enabled);
+    $(`retention-${category}-keep-latest-count`).value = Number(policy.keep_latest_count) > 0
+      ? String(policy.keep_latest_count)
+      : '1';
+  });
+  const storageLimit = retention.storage_limit || {};
+  $('retention-storage-enabled').checked = Boolean(storageLimit.enabled);
+  updateRetentionControlState();
+  updateRetentionStorageCapacity({
+    initializeValue: true,
+    configuredMaxBytes: Number(storageLimit.max_bytes) || 0,
+  });
+}
+
+function retentionSettingsPayload() {
+  const categories = {};
+  RETENTION_CATEGORIES.forEach(([category]) => {
+    categories[category] = {
+      enabled: $(`retention-${category}-enabled`).checked,
+      value: Number($(`retention-${category}-value`).value) || 1,
+      unit: $(`retention-${category}-unit`).value,
+      keep_latest_enabled: $(`retention-${category}-keep-latest-enabled`).checked,
+      keep_latest_count: Number($(`retention-${category}-keep-latest-count`).value) || 1,
+    };
+  });
+  return {
+    categories,
+    storage_limit: {
+      enabled: $('retention-storage-enabled').checked,
+      max_bytes: Math.round(Math.max(0, Number($('retention-storage-gb').value) || 0) * GIB),
+    },
+  };
 }
 
 function updateScheduleVisibility() {
@@ -644,6 +1011,12 @@ function populateSettings(settings) {
   $('vehicle-model-id').value = vehicle.model_id || '';
   $('vehicle-drive-side').value = vehicle.drive_side || '';
   $('vehicle-color').value = vehicle.color || '';
+  $('recording-layout').value = ['standard', 'dashcam'].includes(vehicle.recording_layout)
+    ? vehicle.recording_layout
+    : '';
+  $('surveillance-layout').value = ['standard', 'dashcam'].includes(vehicle.surveillance_layout)
+    ? vehicle.surveillance_layout
+    : '';
   $('vehicle-device-id').value = vehicle.device_id || t('Not detected yet');
   $('vehicle-app-version').value = vehicle.app_version || t('Not detected yet');
   const vehicleLabel = vehicle.model_name || vehicle.name || t('Vehicle');
@@ -666,6 +1039,7 @@ function populateSettings(settings) {
   $('include-timeline').checked = Boolean(content.include_event_timeline);
   $('archive-subdirectory').value = settings.destination?.subdirectory || 'vehicles';
   $('archive-root').value = settings.runtime?.archive_root || '/archive';
+  populateRetentionSettings(settings);
   renderAuthSummary(settings.runtime?.auth?.methods || []);
   $('settings-status').textContent = t('Settings loaded.');
   updateScheduleVisibility();
@@ -721,6 +1095,8 @@ function settingsPayload() {
       model_id: $('vehicle-model-id').value,
       drive_side: $('vehicle-drive-side').value,
       color: $('vehicle-color').value,
+      recording_layout: $('recording-layout').value,
+      surveillance_layout: $('surveillance-layout').value,
       device_id: state.settings?.vehicle?.device_id || '',
       app_version: state.settings?.vehicle?.app_version || '',
       locale: state.settings?.vehicle?.locale || '',
@@ -748,7 +1124,26 @@ function settingsPayload() {
       type: 'local',
       subdirectory: $('archive-subdirectory').value,
     },
+    retention: retentionSettingsPayload(),
   };
+}
+
+function retentionResultMessage(result) {
+  if (!result) return t('Settings saved');
+  if (result.status === 'deferred') {
+    return `${t('Settings saved')} · ${t('Retention will run after the current synchronization.')}`;
+  }
+  if (result.limit_satisfied === false) {
+    return `${t('Settings saved')} · ${t('The storage target could not be reached because the remaining data is protected or unmanaged.')}`;
+  }
+  if (result.status === 'partial' || (Number(result.error_count) || 0) > 0) {
+    return `${t('Settings saved')} · ${t('Retention could not remove some local items.')}`;
+  }
+  const removed = Number(result.deleted_items) || 0;
+  if (!removed) return t('Settings saved');
+  return state.language === 'pt-BR'
+    ? `${t('Settings saved')} · retenção removeu ${removed.toLocaleString(locale())} ${removed === 1 ? 'item local' : 'itens locais'}.`
+    : `${t('Settings saved')} · retention removed ${removed.toLocaleString(locale())} local item${removed === 1 ? '' : 's'}.`;
 }
 
 async function saveSettings(showMessage = true) {
@@ -760,8 +1155,9 @@ async function saveSettings(showMessage = true) {
     $('vehicle-token').value = '';
     applyLanguage(response.settings.interface?.language || 'en');
     $('token-state').textContent = response.settings.vehicle.device_token_configured ? t('A credential is saved. Leave this blank to keep it.') : t('No credential saved.');
-    $('settings-status').textContent = t('Settings saved.');
-    if (showMessage) toast(t('Settings saved'));
+    const resultMessage = retentionResultMessage(response.retention);
+    $('settings-status').textContent = resultMessage;
+    if (showMessage) toast(resultMessage);
     loadOverview();
     return true;
   } catch (error) {
@@ -794,21 +1190,49 @@ async function testConnection() {
   }
 }
 
-async function loadLibrary() {
+async function loadLibrary({ append = false } = {}) {
   updateRecordingTypeFilterState();
+  const requestId = ++state.libraryRequestId;
+  if (state.libraryAbortController) state.libraryAbortController.abort();
+  const controller = new AbortController();
+  state.libraryAbortController = controller;
+  const loadMore = $('library-load-more');
+  if (!append) {
+    state.libraryNextOffset = 0;
+    state.libraryHasMore = false;
+    loadMore.classList.add('hidden');
+  }
+  loadMore.disabled = true;
   $('library-grid').setAttribute('aria-busy', 'true');
   const params = new URLSearchParams();
   if ($('library-category').value) params.set('category', $('library-category').value);
   if ($('library-recording-type').value) params.set('subtype', $('library-recording-type').value);
   if ($('library-search').value.trim()) params.set('q', $('library-search').value.trim());
-  params.set('limit', '200');
+  params.set('limit', '100');
+  params.set('offset', String(append ? state.libraryNextOffset : 0));
   try {
-    const data = await api(`/api/items?${params}`);
+    const data = await api(`/api/items?${params}`, { signal: controller.signal });
+    if (requestId !== state.libraryRequestId) return;
     renderRecordingTypeFilter(data.recording_types || []);
-    renderLibrary(data.items || []);
+    const pageItems = Array.isArray(data.items) ? data.items : [];
+    const items = append
+      ? [...(state.lastLibraryItems || []), ...pageItems]
+      : pageItems;
+    state.libraryHasMore = Boolean(data.has_more);
+    const nextOffset = Number(data.next_offset);
+    state.libraryNextOffset = data.next_offset !== null && Number.isInteger(nextOffset) && nextOffset >= 0
+      ? nextOffset
+      : items.length;
+    renderLibrary(items);
+    loadMore.classList.toggle('hidden', !state.libraryHasMore);
   } catch (error) {
-    $('library-grid').setAttribute('aria-busy', 'false');
+    if (error.name === 'AbortError') return;
     toast(error.message);
+  } finally {
+    if (requestId !== state.libraryRequestId) return;
+    state.libraryAbortController = null;
+    $('library-grid').setAttribute('aria-busy', 'false');
+    loadMore.disabled = false;
   }
 }
 
@@ -836,24 +1260,147 @@ function renderRecordingTypeFilter(types) {
   select.value = selected;
 }
 
+async function requestRecordingRestore(item, button) {
+  const restoreKey = String(item.restore_key || item.source_key || '');
+  item.restore_requested = true;
+  button.disabled = true;
+  button.textContent = t('Requesting…');
+  try {
+    const response = await api('/api/recordings/restore', {
+      method: 'POST',
+      body: JSON.stringify({ source_key: restoreKey }),
+    });
+    item.restore_requested = true;
+    button.textContent = t('Restore queued');
+    const started = response.sync_started === true
+      || response.started === true
+      || response.sync?.started === true
+      || response.status === 'started';
+    toast(t(started
+      ? 'Synchronization started to download the recording again.'
+      : 'Restore queued for the next synchronization.'));
+    await Promise.all([loadOverview(), loadLibrary()]);
+  } catch (error) {
+    item.restore_requested = false;
+    button.disabled = false;
+    button.textContent = t('Download again');
+    toast(t(error.message));
+  }
+}
+
+async function releaseRecordingRetention(item, button) {
+  if (!window.confirm(t('This removes the manual protection. Current retention rules may delete the local copy immediately. Continue?'))) return;
+  button.disabled = true;
+  button.textContent = t('Releasing…');
+  try {
+    const response = await api('/api/recordings/release-retention', {
+      method: 'POST',
+      body: JSON.stringify({ item_id: item.id }),
+    });
+    const removed = response.item_deleted === true;
+    toast(t(removed
+      ? 'The current retention rules removed the local copy.'
+      : 'Automatic retention is enabled again for this recording.'));
+    await Promise.all([loadOverview(), loadLibrary()]);
+  } catch (error) {
+    button.disabled = false;
+    button.textContent = t('Use retention rules');
+    toast(t(error.message));
+  }
+}
+
+function renderDeletedLocalCard(item, label, grid) {
+  const card = document.createElement('article');
+  card.className = 'archive-card deleted-local';
+
+  const preview = document.createElement('div');
+  preview.className = 'archive-preview deleted-local-preview';
+  preview.setAttribute('role', 'img');
+  preview.setAttribute('aria-label', `${t('Deleted locally')}: ${item.filename}`);
+
+  const marker = document.createElement('span');
+  marker.className = 'archive-deleted-marker';
+  const markerIcon = document.createElement('i');
+  markerIcon.textContent = '↻';
+  const markerTitle = document.createElement('strong');
+  markerTitle.textContent = t('Deleted locally');
+  const markerSize = document.createElement('small');
+  const remoteSize = Number(item.remote_size_bytes) || 0;
+  markerSize.textContent = remoteSize > 0
+    ? `${t('0 B stored')} · ${formatBytes(remoteSize)} ${t('on vehicle')}`
+    : t('0 B stored');
+  marker.append(markerIcon, markerTitle, markerSize);
+
+  const typeChip = document.createElement('span');
+  typeChip.className = `archive-type-chip ${item.subtype || item.category}`;
+  typeChip.textContent = label;
+  const sizeChip = document.createElement('span');
+  sizeChip.className = 'archive-size-chip deleted-local-size';
+  sizeChip.textContent = t('0 B stored');
+  preview.append(marker, typeChip, sizeChip);
+
+  const content = document.createElement('div');
+  content.className = 'archive-card-content';
+  const recorded = document.createElement('h3');
+  recorded.textContent = exactTime(item.source_timestamp || item.created_at);
+  const filename = document.createElement('p');
+  filename.className = 'archive-filename';
+  filename.textContent = item.filename;
+  filename.title = item.filename;
+  const explanation = document.createElement('p');
+  explanation.className = 'archive-placeholder-note';
+  explanation.textContent = t('Only metadata is kept. This placeholder disappears after a complete vehicle listing confirms the recording is no longer on the vehicle.');
+
+  const footer = document.createElement('div');
+  footer.className = 'archive-card-footer';
+  const identity = document.createElement('span');
+  const identityDot = document.createElement('i');
+  const identityName = document.createTextNode(item.vehicle ? title(item.vehicle) : t('Vehicle'));
+  identity.append(identityDot, identityName);
+  const restore = document.createElement('button');
+  restore.type = 'button';
+  restore.className = 'button secondary small archive-restore';
+  restore.disabled = Boolean(item.restore_requested || item.cleanup_pending);
+  restore.textContent = t(item.cleanup_pending
+    ? 'Local cleanup pending'
+    : item.restore_requested ? 'Restore queued' : 'Download again');
+  restore.addEventListener('click', () => requestRecordingRestore(item, restore));
+  footer.append(identity, restore);
+  content.append(recorded, filename, explanation, footer);
+  card.append(preview, content);
+  grid.append(card);
+}
+
 function renderLibrary(items) {
   state.lastLibraryItems = items;
   const grid = $('library-grid');
   grid.replaceChildren();
   grid.setAttribute('aria-busy', 'false');
   $('library-empty').classList.toggle('hidden', items.length > 0);
-  const totalBytes = items.reduce((total, item) => total + (Number(item.size_bytes) || 0), 0);
+  const archivedItems = items.filter(item => !item.deleted_local);
+  const deletedLocalItems = items.filter(item => Boolean(item.deleted_local));
+  const totalBytes = archivedItems.reduce((total, item) => total + (Number(item.size_bytes) || 0), 0);
+  const archivedSummary = state.language === 'pt-BR'
+    ? `${archivedItems.length.toLocaleString(locale())} ${t(archivedItems.length === 1 ? 'archived item' : 'archived items')}`
+    : `${archivedItems.length.toLocaleString(locale())} archived item${archivedItems.length === 1 ? '' : 's'}`;
+  const deletedSummary = `${deletedLocalItems.length.toLocaleString(locale())} ${t(deletedLocalItems.length === 1 ? 'item deleted locally' : 'items deleted locally')}`;
   $('library-summary').textContent = items.length
-    ? (state.language === 'pt-BR'
-      ? `${items.length.toLocaleString(locale())} ${items.length === 1 ? t('archived item') : t('archived items')} · ${formatBytes(totalBytes)}`
-      : `${items.length.toLocaleString(locale())} archived item${items.length === 1 ? '' : 's'} · ${formatBytes(totalBytes)}`)
+    ? `${archivedSummary} · ${deletedSummary} · ${formatBytes(totalBytes)} ${t('stored')}`
     : t('No archived items found');
+  $('library-view-note-copy').textContent = t(deletedLocalItems.length
+    ? 'Stored media and metadata-only placeholders'
+    : 'Private previews from your archive');
+  $('library-view-note-copy').parentElement.classList.toggle('has-placeholders', deletedLocalItems.length > 0);
 
   items.forEach(item => {
     const isVideo = String(item.media_type || '').startsWith('video/');
     const label = item.category === 'recordings' && item.subtype
       ? recordingSubtypeLabel(item.subtype)
-      : title(item.category);
+      : labelFor(item.category);
+    if (item.deleted_local) {
+      renderDeletedLocalCard(item, label, grid);
+      return;
+    }
     const card = document.createElement('article');
     card.className = `archive-card${isVideo ? ' is-video' : ''}`;
 
@@ -924,7 +1471,19 @@ function renderLibrary(items) {
     download.href = `/media/${item.id}`;
     download.download = item.filename;
     download.textContent = t(isVideo ? 'Download' : 'Open file');
-    footer.append(identity, download);
+    const actions = document.createElement('div');
+    actions.className = 'archive-card-actions';
+    if (item.retention_protected) {
+      const release = document.createElement('button');
+      release.type = 'button';
+      release.className = 'archive-retention-release';
+      release.title = t('Protected from retention');
+      release.textContent = t('Use retention rules');
+      release.addEventListener('click', () => releaseRecordingRetention(item, release));
+      actions.append(release);
+    }
+    actions.append(download);
+    footer.append(identity, actions);
     content.append(recorded, filename, footer);
     card.append(preview, content);
     grid.append(card);
@@ -1193,18 +1752,24 @@ $('menu-button').addEventListener('click', () => document.body.classList.toggle(
 $('sync-now-top').addEventListener('click', runSync);
 $('sync-now-hero').addEventListener('click', runSync);
 $('refresh-overview').addEventListener('click', loadOverview);
-$('refresh-library').addEventListener('click', loadLibrary);
+$('refresh-library').addEventListener('click', () => loadLibrary());
+$('library-load-more').addEventListener('click', () => loadLibrary({ append: true }));
 $('library-category').addEventListener('change', () => {
   updateRecordingTypeFilterState();
   loadLibrary();
 });
-$('library-recording-type').addEventListener('change', loadLibrary);
+$('library-recording-type').addEventListener('change', () => loadLibrary());
 let searchTimer;
 $('library-search').addEventListener('input', () => {
   clearTimeout(searchTimer);
   searchTimer = setTimeout(loadLibrary, 300);
 });
 $('schedule-mode').addEventListener('change', updateScheduleVisibility);
+$('retention-category-options').addEventListener('change', updateRetentionControlState);
+$('retention-storage-enabled').addEventListener('change', () => {
+  updateRetentionControlState();
+  updateRetentionStorageCapacity();
+});
 $('interface-language').addEventListener('change', () => {
   applyLanguage($('interface-language').value);
   $('settings-status').textContent = state.language === 'pt-BR'
@@ -1292,6 +1857,7 @@ $('player-dialog').addEventListener('cancel', event => {
   closePlayer();
 });
 
+buildRetentionControls();
 updateRecordingTypeFilterState();
 applyLanguage(state.language, { rerender: false });
 initialize();

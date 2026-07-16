@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import unittest
 from datetime import datetime, timezone
+from unittest.mock import patch
 
 from app.config import (
+    CATEGORIES,
     SettingsError,
     base_url_origin,
     default_settings,
@@ -24,7 +26,45 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings["vehicle"]["recording_layout"], "")
         self.assertEqual(settings["vehicle"]["surveillance_layout"], "")
         self.assertTrue(settings["schedule"]["only_wifi"])
+        self.assertEqual(
+            settings["content"]["categories"],
+            [
+                "recordings",
+                "trips",
+                "charging",
+                "automations",
+                "key_mappings",
+                "telemetry",
+            ],
+        )
         self.assertEqual(settings["destination"]["type"], "local")
+        self.assertEqual(set(settings["retention"]["categories"]), set(CATEGORIES))
+        for rule in settings["retention"]["categories"].values():
+            self.assertEqual(
+                rule,
+                {
+                    "enabled": False,
+                    "value": 30,
+                    "unit": "days",
+                    "keep_latest_enabled": False,
+                    "keep_latest_count": 1,
+                },
+            )
+        self.assertEqual(
+            settings["retention"]["storage_limit"],
+            {"enabled": False, "max_bytes": 0},
+        )
+
+    def test_invalid_default_subdirectory_fails_before_startup(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {"ARCHIVE_DEFAULT_SUBDIRECTORY": "../outside"},
+        ):
+            with self.assertRaisesRegex(
+                SettingsError,
+                "ARCHIVE_DEFAULT_SUBDIRECTORY is invalid",
+            ):
+                default_settings()
 
     def test_partial_update_preserves_existing_values(self) -> None:
         current = validate_settings(default_settings())
@@ -51,6 +91,143 @@ class SettingsTests(unittest.TestCase):
             updated,
         )
         self.assertEqual(updated_again["interface"]["language"], "pt-BR")
+
+    def test_retention_partial_updates_preserve_other_rules(self) -> None:
+        current = validate_settings(
+            {
+                "retention": {
+                    "categories": {
+                        "recordings": {
+                            "enabled": True,
+                            "value": 48,
+                            "unit": "hours",
+                            "keep_latest_enabled": True,
+                            "keep_latest_count": 12,
+                        }
+                    },
+                    "storage_limit": {
+                        "enabled": True,
+                        "max_bytes": 50_000_000_000,
+                    },
+                }
+            }
+        )
+
+        updated = validate_settings(
+            {
+                "retention": {
+                    "categories": {
+                        "trips": {"enabled": True, "value": 90},
+                        "recordings": {"keep_latest_count": 20},
+                    }
+                }
+            },
+            current,
+        )
+
+        self.assertEqual(
+            updated["retention"]["categories"]["recordings"],
+            {
+                "enabled": True,
+                "value": 48,
+                "unit": "hours",
+                "keep_latest_enabled": True,
+                "keep_latest_count": 20,
+            },
+        )
+        self.assertEqual(
+            updated["retention"]["categories"]["trips"],
+            {
+                "enabled": True,
+                "value": 90,
+                "unit": "days",
+                "keep_latest_enabled": False,
+                "keep_latest_count": 1,
+            },
+        )
+        self.assertEqual(
+            updated["retention"]["storage_limit"],
+            {"enabled": True, "max_bytes": 50_000_000_000},
+        )
+
+    def test_legacy_settings_gain_retention_defaults(self) -> None:
+        legacy = default_settings()
+        legacy.pop("retention")
+
+        normalized = validate_settings(legacy)
+        partially_updated = validate_settings(
+            {"vehicle": {"name": "Legacy EV"}},
+            legacy,
+        )
+
+        for settings in (normalized, partially_updated):
+            self.assertEqual(set(settings["retention"]["categories"]), set(CATEGORIES))
+            self.assertEqual(
+                settings["retention"]["storage_limit"],
+                {"enabled": False, "max_bytes": 0},
+            )
+
+    def test_retention_rejects_invalid_category_rules(self) -> None:
+        invalid_updates = (
+            {"recordings": {"enabled": 1}},
+            {"recordings": {"value": 0}},
+            {"recordings": {"value": 1_000_001}},
+            {"recordings": {"value": "30"}},
+            {"recordings": {"unit": "weeks"}},
+            {"recordings": {"keep_latest_enabled": 1}},
+            {"recordings": {"keep_latest_count": 0}},
+            {"recordings": {"keep_latest_count": 1_000_001}},
+            {"recordings": {"keep_latest_count": "5"}},
+            {"unknown": {"enabled": False}},
+        )
+        for categories in invalid_updates:
+            with self.subTest(categories=categories):
+                with self.assertRaises(SettingsError):
+                    validate_settings({"retention": {"categories": categories}})
+
+    def test_retention_rejects_invalid_storage_limits(self) -> None:
+        for storage_limit in (
+            {"enabled": 1},
+            {"enabled": True, "max_bytes": 0},
+            {"max_bytes": -1},
+            {"max_bytes": 1 << 63},
+            {"max_bytes": "1024"},
+            {"max_bytes": True},
+        ):
+            with self.subTest(storage_limit=storage_limit):
+                with self.assertRaises(SettingsError):
+                    validate_settings(
+                        {"retention": {"storage_limit": storage_limit}}
+                    )
+
+    def test_retention_accepts_boundary_values(self) -> None:
+        settings = validate_settings(
+            {
+                "retention": {
+                    "categories": {
+                        "recordings": {
+                            "enabled": True,
+                            "value": 1_000_000,
+                            "unit": "minutes",
+                            "keep_latest_enabled": True,
+                            "keep_latest_count": 1_000_000,
+                        }
+                    },
+                    "storage_limit": {
+                        "enabled": True,
+                        "max_bytes": (1 << 63) - 1,
+                    },
+                }
+            }
+        )
+        rule = settings["retention"]["categories"]["recordings"]
+        self.assertEqual(rule["value"], 1_000_000)
+        self.assertEqual(rule["unit"], "minutes")
+        self.assertEqual(rule["keep_latest_count"], 1_000_000)
+        self.assertEqual(
+            settings["retention"]["storage_limit"]["max_bytes"],
+            (1 << 63) - 1,
+        )
 
     def test_interface_language_rejects_unsupported_values(self) -> None:
         for language in ("pt", "en-US", "", None, 123):

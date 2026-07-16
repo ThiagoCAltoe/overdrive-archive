@@ -26,6 +26,8 @@ SCHEDULE_MODES = ("manual", "interval", "daily")
 INTERVAL_UNITS = ("minutes", "hours", "days")
 INTERFACE_LANGUAGES = ("en", "pt-BR")
 CAMERA_LAYOUTS = ("standard", "dashcam")
+_MAX_RETENTION_VALUE = 1_000_000
+_MAX_STORAGE_BYTES = (1 << 63) - 1
 
 _SUBDIRECTORY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,119}$")
 _TIME_RE = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
@@ -41,6 +43,17 @@ def default_settings() -> dict[str, Any]:
         ZoneInfo(timezone_name)
     except ZoneInfoNotFoundError:
         timezone_name = "UTC"
+
+    raw_subdirectory = (
+        os.environ.get("ARCHIVE_DEFAULT_SUBDIRECTORY", "vehicles").strip()
+        or "vehicles"
+    )
+    try:
+        default_subdirectory = normalize_subdirectory(raw_subdirectory)
+    except SettingsError as exc:
+        raise SettingsError(
+            f"ARCHIVE_DEFAULT_SUBDIRECTORY is invalid: {exc}"
+        ) from exc
 
     return {
         "interface": {
@@ -91,10 +104,23 @@ def default_settings() -> dict[str, Any]:
         },
         "destination": {
             "type": "local",
-            "subdirectory": (
-                os.environ.get("ARCHIVE_DEFAULT_SUBDIRECTORY", "vehicles").strip()
-                or "vehicles"
-            ),
+            "subdirectory": default_subdirectory,
+        },
+        "retention": {
+            "categories": {
+                category: {
+                    "enabled": False,
+                    "value": 30,
+                    "unit": "days",
+                    "keep_latest_enabled": False,
+                    "keep_latest_count": 1,
+                }
+                for category in CATEGORIES
+            },
+            "storage_limit": {
+                "enabled": False,
+                "max_bytes": 0,
+            },
         },
     }
 
@@ -140,6 +166,20 @@ def _integer(value: Any, label: str, minimum: int, maximum: int) -> int:
     if parsed < minimum or parsed > maximum:
         raise SettingsError(f"{label} must be between {minimum} and {maximum}.")
     return parsed
+
+
+def _strict_boolean(value: Any, label: str) -> bool:
+    if not isinstance(value, bool):
+        raise SettingsError(f"{label} must be true or false.")
+    return value
+
+
+def _strict_integer(value: Any, label: str, minimum: int, maximum: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise SettingsError(f"{label} must be an integer.")
+    if value < minimum or value > maximum:
+        raise SettingsError(f"{label} must be between {minimum} and {maximum}.")
+    return value
 
 
 def normalize_base_url(value: Any) -> str:
@@ -261,7 +301,8 @@ def validate_settings(
     if not isinstance(candidate, dict):
         raise SettingsError("Settings payload must be an object.")
 
-    base = current if isinstance(current, dict) else default_settings()
+    defaults = default_settings()
+    base = _merge(defaults, current) if isinstance(current, dict) else defaults
     raw = _merge(base, candidate)
 
     interface_raw = raw.get("interface")
@@ -269,6 +310,7 @@ def validate_settings(
     schedule_raw = raw.get("schedule")
     content_raw = raw.get("content")
     destination_raw = raw.get("destination")
+    retention_raw = raw.get("retention")
     if not all(
         isinstance(section, dict)
         for section in (
@@ -277,6 +319,7 @@ def validate_settings(
             schedule_raw,
             content_raw,
             destination_raw,
+            retention_raw,
         )
     ):
         raise SettingsError("Settings sections must be objects.")
@@ -285,6 +328,7 @@ def validate_settings(
     assert isinstance(schedule_raw, dict)
     assert isinstance(content_raw, dict)
     assert isinstance(destination_raw, dict)
+    assert isinstance(retention_raw, dict)
 
     interface_language = _string(
         interface_raw.get("language"),
@@ -422,12 +466,82 @@ def validate_settings(
         ),
     }
 
+    retention_categories_raw = retention_raw.get("categories")
+    storage_limit_raw = retention_raw.get("storage_limit")
+    if not isinstance(retention_categories_raw, dict):
+        raise SettingsError("Retention categories must be an object.")
+    if not isinstance(storage_limit_raw, dict):
+        raise SettingsError("Storage limit must be an object.")
+    unsupported_retention_categories = set(retention_categories_raw) - set(CATEGORIES)
+    if unsupported_retention_categories:
+        category = sorted(
+            (str(value) for value in unsupported_retention_categories),
+            key=str.casefold,
+        )[0]
+        raise SettingsError(f"Unsupported retention category: {category!r}.")
+
+    retention_categories: dict[str, dict[str, Any]] = {}
+    for category in CATEGORIES:
+        rule = retention_categories_raw.get(category)
+        if not isinstance(rule, dict):
+            raise SettingsError(f"Retention rule for {category!r} must be an object.")
+        unit = rule.get("unit")
+        if unit not in INTERVAL_UNITS:
+            raise SettingsError(
+                f"Retention unit for {category!r} must be minutes, hours, or days."
+            )
+        retention_categories[category] = {
+            "enabled": _strict_boolean(
+                rule.get("enabled"),
+                f"Retention enabled for {category!r}",
+            ),
+            "value": _strict_integer(
+                rule.get("value"),
+                f"Retention value for {category!r}",
+                1,
+                _MAX_RETENTION_VALUE,
+            ),
+            "unit": unit,
+            "keep_latest_enabled": _strict_boolean(
+                rule.get("keep_latest_enabled"),
+                f"Keep-latest enabled for {category!r}",
+            ),
+            "keep_latest_count": _strict_integer(
+                rule.get("keep_latest_count"),
+                f"Keep-latest count for {category!r}",
+                1,
+                _MAX_RETENTION_VALUE,
+            ),
+        }
+
+    storage_enabled = _strict_boolean(
+        storage_limit_raw.get("enabled"),
+        "Storage limit enabled",
+    )
+    storage_max_bytes = _strict_integer(
+        storage_limit_raw.get("max_bytes"),
+        "Storage limit",
+        0,
+        _MAX_STORAGE_BYTES,
+    )
+    if storage_enabled and storage_max_bytes == 0:
+        raise SettingsError("Storage limit must be greater than zero when enabled.")
+
+    retention = {
+        "categories": retention_categories,
+        "storage_limit": {
+            "enabled": storage_enabled,
+            "max_bytes": storage_max_bytes,
+        },
+    }
+
     return {
         "interface": interface,
         "vehicle": vehicle,
         "schedule": schedule,
         "content": content,
         "destination": destination,
+        "retention": retention,
     }
 
 
