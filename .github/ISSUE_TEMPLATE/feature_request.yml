@@ -1,0 +1,60 @@
+name: Feature request
+description: Propose a reusable capability or integration.
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please describe a general use case. Do not include private vehicle data,
+        credentials, personal infrastructure details, or proprietary gateway
+        implementation secrets.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What workflow is difficult or impossible today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Explain the desired configuration and user-visible result.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Area
+      options:
+        - Recording compatibility
+        - Storage destination
+        - Authentication provider
+        - Vehicle profile
+        - Scheduler or network policy
+        - Archive library
+        - Notifications
+        - Documentation or deployment
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+
+  - type: checkboxes
+    id: principles
+    attributes:
+      label: Project principles
+      options:
+        - label: The proposal can be configurable and vehicle-model neutral.
+          required: true
+        - label: The proposal does not require publishing private vehicle data or credentials.
+          required: true

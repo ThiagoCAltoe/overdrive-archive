@@ -1,0 +1,385 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#09101d">
+  <title>Overdrive Archive</title>
+  <link rel="icon" href="/static/logo.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <section id="login-screen" class="login-screen hidden" aria-labelledby="login-title">
+    <div class="login-glow login-glow-a"></div>
+    <div class="login-glow login-glow-b"></div>
+    <form id="login-form" class="login-card">
+      <img src="/static/logo.svg" alt="" width="64" height="64">
+      <p class="eyebrow">SELF-HOSTED VEHICLE ARCHIVE</p>
+      <h1 id="login-title">Welcome back</h1>
+      <p class="muted">Sign in to manage synchronization and private vehicle data.</p>
+      <div id="auth-methods" class="auth-methods" aria-label="Sign-in method"></div>
+      <div id="local-login-fields" class="login-fields">
+        <label class="field">
+          <span>Username</span>
+          <input id="login-username" type="text" autocomplete="username" value="admin">
+        </label>
+        <label class="field">
+          <span>Password</span>
+          <input id="login-password" type="password" autocomplete="current-password">
+        </label>
+      </div>
+      <div id="otp-login-fields" class="login-fields hidden">
+        <p id="otp-description" class="otp-description">Request a one-time sign-in code.</p>
+        <div class="otp-row">
+          <label class="field grow">
+            <span>One-time code</span>
+            <input id="login-code" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="000000">
+          </label>
+          <button id="request-code" class="button secondary" type="button">Send code</button>
+        </div>
+      </div>
+      <button id="login-button" class="button primary wide" type="submit">Sign in</button>
+      <p id="login-error" class="form-error" role="alert"></p>
+      <small>Unofficial community project. Your data stays on your infrastructure.</small>
+    </form>
+  </section>
+
+  <div id="app-shell" class="app-shell hidden">
+    <aside class="sidebar">
+      <a class="brand" href="#" data-view-target="overview" aria-label="Overdrive Archive home">
+        <img src="/static/logo.svg" alt="" width="42" height="42">
+        <span><strong>Overdrive</strong><small>Archive</small></span>
+      </a>
+      <nav class="nav" aria-label="Primary navigation">
+        <button class="nav-link active" type="button" data-view-target="overview">
+          <span class="nav-icon">⌁</span><span>Overview</span>
+        </button>
+        <button class="nav-link" type="button" data-view-target="library">
+          <span class="nav-icon">▤</span><span>Archive</span>
+        </button>
+        <button class="nav-link" type="button" data-view-target="settings">
+          <span class="nav-icon">⚙</span><span>Settings</span>
+        </button>
+      </nav>
+      <div class="sidebar-foot">
+        <div class="privacy-chip"><span></span> Self-hosted</div>
+        <button id="logout-button" class="button ghost wide" type="button">Sign out</button>
+      </div>
+    </aside>
+
+    <div class="workspace">
+      <header class="topbar">
+        <button id="menu-button" class="menu-button" type="button" aria-label="Open navigation">☰</button>
+        <div>
+          <p id="page-eyebrow" class="eyebrow">ARCHIVE CONTROL CENTER</p>
+          <h1 id="page-title">Overview</h1>
+        </div>
+        <div class="topbar-actions">
+          <div id="sync-chip" class="status-chip"><span></span><strong>Idle</strong></div>
+          <button id="sync-now-top" class="button primary" type="button">Sync now</button>
+        </div>
+      </header>
+
+      <main>
+        <section id="view-overview" class="view active">
+          <article class="hero">
+            <div class="hero-copy">
+              <div id="vehicle-state" class="connection-label"><span></span> Ready to connect</div>
+              <h2>Your vehicle data.<br><em>Your infrastructure.</em></h2>
+              <p>Archive recordings, trips, charging sessions and configuration snapshots on a local disk or mounted NAS.</p>
+              <div class="hero-actions">
+                <button id="sync-now-hero" class="button primary" type="button">Start synchronization</button>
+                <button class="button secondary" type="button" data-view-target="settings">Configure source</button>
+              </div>
+            </div>
+            <div class="sync-visual" aria-hidden="true">
+              <div class="orbit orbit-a"></div>
+              <div class="orbit orbit-b"></div>
+              <div class="node node-car">VEHICLE</div>
+              <div class="transfer-line"><i></i><i></i><i></i></div>
+              <div class="node node-archive">ARCHIVE</div>
+            </div>
+          </article>
+
+          <section class="metrics" aria-label="Archive summary">
+            <article class="metric">
+              <span class="metric-icon blue">▤</span>
+              <div><small>Archived items</small><strong id="metric-items">0</strong><em id="metric-categories">No categories yet</em></div>
+            </article>
+            <article class="metric">
+              <span class="metric-icon violet">◫</span>
+              <div><small>Primary content size</small><strong id="metric-storage">0 B</strong><em>Videos and archived snapshots</em></div>
+            </article>
+            <article class="metric">
+              <span class="metric-icon green">✓</span>
+              <div><small>Last synchronization</small><strong id="metric-last-sync">Never</strong><em id="metric-last-result">No run recorded</em></div>
+            </article>
+            <article class="metric">
+              <span class="metric-icon amber">◷</span>
+              <div><small>Next scheduled run</small><strong id="metric-next-sync">Manual</strong><em id="metric-policy">Wi-Fi policy enabled</em></div>
+            </article>
+          </section>
+
+          <section class="content-grid">
+            <article class="panel span-2">
+              <div class="panel-head">
+                <div><p class="eyebrow">RECENT ACTIVITY</p><h3>Synchronization runs</h3></div>
+                <button id="refresh-overview" class="button ghost" type="button">Refresh</button>
+              </div>
+              <div class="table-wrap">
+                <table>
+                  <thead><tr><th>Started</th><th>Trigger</th><th>Result</th><th>New</th><th>Transferred</th><th>Details</th></tr></thead>
+                  <tbody id="runs-body"></tbody>
+                </table>
+              </div>
+              <div id="runs-empty" class="empty-state hidden">No synchronization runs yet.</div>
+            </article>
+
+            <article class="panel">
+              <div class="panel-head">
+                <div><p class="eyebrow">DATA INVENTORY</p><h3>Archive categories</h3></div>
+              </div>
+              <div id="category-list" class="category-list"></div>
+              <div id="categories-empty" class="empty-state">Archived data will appear here.</div>
+            </article>
+          </section>
+        </section>
+
+        <section id="view-library" class="view">
+          <div class="section-intro">
+            <div><p class="eyebrow">BROWSE & PLAY</p><h2>Archive library</h2><p>Scan visual previews, filter recording types, and play archived media without leaving the library.</p></div>
+            <button id="refresh-library" class="button secondary" type="button">Refresh library</button>
+          </div>
+          <article class="panel library-panel">
+            <div class="filter-bar">
+              <label class="field compact"><span>Category</span>
+                <select id="library-category">
+                  <option value="">All categories</option>
+                  <option value="recordings">Recordings</option>
+                  <option value="trips">Trips</option>
+                  <option value="charging">Charging</option>
+                  <option value="automations">Automations</option>
+                  <option value="key_mappings">Key mappings</option>
+                  <option value="telemetry">Telemetry</option>
+                  <option value="roadsense">RoadSense</option>
+                  <option value="configuration">Configuration</option>
+                </select>
+              </label>
+              <label class="field compact"><span>Recording type</span>
+                <select id="library-recording-type">
+                  <option value="">All recording types</option>
+                  <option value="replay">Replay</option>
+                  <option value="drive">ACC / drive</option>
+                  <option value="surveillance">Surveillance</option>
+                  <option value="proximity">Proximity</option>
+                  <option value="oem_dashcam">OEM dashcam</option>
+                </select>
+              </label>
+              <label class="field compact grow"><span>Search</span><input id="library-search" type="search" placeholder="Filename or vehicle"></label>
+            </div>
+            <div class="library-results-head">
+              <div>
+                <p class="eyebrow">VISUAL ARCHIVE</p>
+                <h3 id="library-summary">Loading archived items…</h3>
+              </div>
+              <span class="library-view-note"><i></i> Private previews from your archive</span>
+            </div>
+            <div id="library-grid" class="archive-grid" aria-live="polite" aria-busy="true"></div>
+            <div id="library-empty" class="empty-state hidden">No archived items match these filters.</div>
+          </article>
+        </section>
+
+        <section id="view-settings" class="view">
+          <div class="section-intro">
+            <div><p class="eyebrow">SYNC POLICY</p><h2>Settings</h2><p>Every policy is configurable. Nothing here changes the current Overdrive configuration in your vehicle.</p></div>
+            <div class="section-actions">
+              <button id="test-connection" class="button secondary" type="button">Save & test connection</button>
+              <button id="save-settings-top" class="button primary" type="button">Save settings</button>
+            </div>
+          </div>
+
+          <form id="settings-form" class="settings-grid">
+            <article class="panel settings-card">
+              <div class="settings-title"><span>01</span><div><h3>Interface</h3><p>Choose the language used by this installation.</p></div></div>
+              <div class="form-grid">
+                <label class="field full"><span>Interface language</span>
+                  <select id="interface-language">
+                    <option value="en">English</option>
+                    <option value="pt-BR">Português (Brasil)</option>
+                  </select>
+                </label>
+              </div>
+            </article>
+
+            <article class="panel settings-card">
+              <div class="settings-title"><span>02</span><div><h3>Vehicle connection</h3><p>Connect through a trusted LAN address or private VPN such as Tailscale.</p></div></div>
+              <div class="form-grid">
+                <label class="field"><span>Vehicle name</span><input id="vehicle-name" maxlength="80" required placeholder="My vehicle"></label>
+                <label class="field"><span>Overdrive URL</span><input id="vehicle-url" type="url" maxlength="500" placeholder="http://100.x.x.x:8080"></label>
+                <label class="field full"><span>Access code, full token, or bearer JWT</span><input id="vehicle-token" type="password" maxlength="4096" autocomplete="new-password" placeholder="Leave blank to keep the saved credential"><small id="token-state">No credential saved</small></label>
+                <label class="toggle-row full accent-toggle"><input id="auto-detect-profile" type="checkbox"><span class="toggle"></span><span><strong>Import the available Overdrive profile</strong><small>Refreshes device and version details, and fills empty model fields from Overdrive's selected visual profile. Manual values are preserved.</small></span></label>
+                <label class="field"><span>Vehicle model</span><input id="vehicle-model-name" maxlength="120" placeholder="Imported profile or manual value"></label>
+                <label class="field"><span>Model ID</span><input id="vehicle-model-id" maxlength="80" placeholder="e.g. dolphin, seagull, atto3"></label>
+                <label class="field"><span>Drive side</span><select id="vehicle-drive-side"><option value="">Unknown / automatic</option><option value="lhd">Left-hand drive</option><option value="rhd">Right-hand drive</option></select></label>
+                <label class="field"><span>Vehicle color</span><input id="vehicle-color" maxlength="30" placeholder="#E8E8EC"></label>
+                <label class="field"><span>Detected device ID</span><input id="vehicle-device-id" readonly></label>
+                <label class="field"><span>Detected Overdrive version</span><input id="vehicle-app-version" readonly></label>
+                <label class="toggle-row full"><input id="verify-tls" type="checkbox"><span class="toggle"></span><span><strong>Verify TLS certificates</strong><small>Keep enabled for HTTPS. Disable only for a trusted self-signed endpoint.</small></span></label>
+                <label class="field"><span>Request timeout (seconds)</span><input id="request-timeout" type="number" min="5" max="180"></label>
+              </div>
+            </article>
+
+            <article class="panel settings-card">
+              <div class="settings-title"><span>03</span><div><h3>Schedule & network</h3><p>Run manually, on an interval, or once per day.</p></div></div>
+              <div class="form-grid">
+                <label class="toggle-row full"><input id="schedule-enabled" type="checkbox"><span class="toggle"></span><span><strong>Enable automatic synchronization</strong><small>Manual synchronization remains available when disabled.</small></span></label>
+                <label class="field"><span>Schedule mode</span>
+                  <select id="schedule-mode"><option value="manual">Manual only</option><option value="interval">Every interval</option><option value="daily">Daily at a specific time</option></select>
+                </label>
+                <div id="interval-fields" class="inline-fields">
+                  <label class="field"><span>Every</span><input id="interval-value" type="number" min="1" max="10080"></label>
+                  <label class="field"><span>Unit</span><select id="interval-unit"><option value="minutes">Minutes</option><option value="hours">Hours</option><option value="days">Days</option></select></label>
+                </div>
+                <label id="daily-field" class="field"><span>Daily time</span><input id="daily-time" type="time"></label>
+                <label class="field"><span>Timezone</span><input id="schedule-timezone" maxlength="80" placeholder="UTC"></label>
+                <label class="toggle-row full accent-toggle"><input id="only-wifi" type="checkbox"><span class="toggle"></span><span><strong>Download only while the vehicle is on Wi-Fi</strong><small>Turn this off to allow synchronization on any network reported by Overdrive.</small></span></label>
+                <label class="field full"><span>Allowed Wi-Fi networks (optional)</span><textarea id="allowed-ssids" rows="3" placeholder="Home Wi-Fi&#10;Garage Wi-Fi"></textarea><small>One SSID per line. Leave empty to allow every Wi-Fi network.</small></label>
+              </div>
+            </article>
+
+            <article class="panel settings-card">
+              <div class="settings-title"><span>04</span><div><h3>Data selection</h3><p>Select exactly what should be archived.</p></div></div>
+              <fieldset>
+                <legend>Categories</legend>
+                <div class="check-grid" id="category-options">
+                  <label><input type="checkbox" value="recordings"><span>Recordings<small>ACC, replay, surveillance and dashcam</small></span></label>
+                  <label><input type="checkbox" value="trips"><span>Trips<small>Trip summary and statistics</small></span></label>
+                  <label><input type="checkbox" value="charging"><span>Charging<small>Sessions and charging history</small></span></label>
+                  <label><input type="checkbox" value="automations"><span>Automations<small>Read-only automation snapshot</small></span></label>
+                  <label><input type="checkbox" value="key_mappings"><span>Key mappings<small>Buttons and assigned actions</small></span></label>
+                  <label><input type="checkbox" value="telemetry"><span>Telemetry<small>Live snapshot and trip telemetry</small></span></label>
+                  <label><input type="checkbox" value="roadsense"><span>RoadSense<small>Experimental hazard export</small></span></label>
+                  <label><input type="checkbox" value="configuration"><span>Configuration<small>Redacted settings only</small></span></label>
+                </div>
+              </fieldset>
+              <fieldset>
+                <legend>Recording types</legend>
+                <div class="check-grid compact-checks" id="recording-options">
+                  <label><input type="checkbox" value="normal"><span>ACC / drive</span></label>
+                  <label><input type="checkbox" value="replay"><span>Instant replay</span></label>
+                  <label><input type="checkbox" value="sentry"><span>Surveillance</span></label>
+                  <label><input type="checkbox" value="proximity"><span>Proximity</span></label>
+                  <label><input type="checkbox" value="oemDashcam"><span>OEM dashcam</span></label>
+                </div>
+              </fieldset>
+              <div class="form-grid">
+                <label class="toggle-row full accent-toggle"><input id="include-unknown-recording-types" type="checkbox"><span class="toggle"></span><span><strong>Automatically include new recording types</strong><small>Preserves and tags recording types introduced by future Overdrive releases, even before this archive UI knows their friendly name.</small></span></label>
+              </div>
+              <fieldset>
+                <legend>Surveillance severity</legend>
+                <div class="severity-options" id="severity-options">
+                  <label class="notice"><input type="checkbox" value="NOTICE"><span>Notice</span></label>
+                  <label class="alert"><input type="checkbox" value="ALERT"><span>Alert</span></label>
+                  <label class="critical"><input type="checkbox" value="CRITICAL"><span>Critical</span></label>
+                </div>
+              </fieldset>
+              <div class="form-grid">
+                <label class="toggle-row full"><input id="include-thumbnails" type="checkbox"><span class="toggle"></span><span><strong>Download thumbnails</strong><small>Stores the best available preview next to each video.</small></span></label>
+                <label class="toggle-row full"><input id="include-timeline" type="checkbox"><span class="toggle"></span><span><strong>Download event timelines</strong><small>Stores available detection metadata next to surveillance clips.</small></span></label>
+              </div>
+            </article>
+
+            <article class="panel settings-card">
+              <div class="settings-title"><span>05</span><div><h3>Destination</h3><p>The MVP writes to a local filesystem. Mount an NFS or SMB share into Docker to use a NAS.</p></div></div>
+              <div class="destination-banner">
+                <span class="metric-icon green">✓</span>
+                <div><strong>Local / mounted NAS</strong><small>Streaming writes, SHA-256 checksums and atomic finalization</small></div>
+              </div>
+              <div class="form-grid">
+                <label class="field full"><span>Archive subdirectory</span><input id="archive-subdirectory" maxlength="120" placeholder="vehicles"><small>Created below the Docker archive volume.</small></label>
+                <label class="field full"><span>Container archive root</span><input id="archive-root" readonly></label>
+              </div>
+              <div class="roadmap-note"><strong>Destination roadmap</strong><span>SFTP, WebDAV and S3-compatible storage are planned as separate adapters.</span></div>
+            </article>
+
+            <article class="panel settings-card">
+              <div class="settings-title"><span>06</span><div><h3>Authentication</h3><p>The installer chooses which sign-in methods are available. Local password is the default; Telegram and WhatsApp are optional.</p></div></div>
+              <div id="auth-method-summary" class="auth-summary"></div>
+              <div class="roadmap-note"><strong>Provider configuration</strong><span>Provider secrets are supplied through Docker environment variables or secrets, so bot tokens never appear in the browser or public repository.</span></div>
+            </article>
+
+            <div class="save-bar">
+              <p id="settings-status">Changes are stored only in this new archive application.</p>
+              <button id="save-settings-bottom" class="button primary" type="submit">Save settings</button>
+            </div>
+          </form>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <dialog id="player-dialog" class="player-dialog">
+    <div class="player-layout">
+      <div id="player-stage" class="player-stage">
+        <div id="player-viewport" class="player-viewport layout-standard view-all">
+          <video id="player" playsinline preload="metadata" tabindex="0" aria-label="Archived recording"></video>
+          <div id="player-camera-selector" class="player-camera-selector" role="group" aria-label="Camera view">
+            <button class="player-camera-button active" type="button" data-camera-view="all" aria-controls="player" aria-pressed="true">All</button>
+            <button class="player-camera-button" type="button" data-camera-view="front" aria-controls="player" aria-pressed="false">Front</button>
+            <button class="player-camera-button" type="button" data-camera-view="right" aria-controls="player" aria-pressed="false">Right</button>
+            <button class="player-camera-button" type="button" data-camera-view="rear" aria-controls="player" aria-pressed="false">Rear</button>
+            <button class="player-camera-button" type="button" data-camera-view="left" aria-controls="player" aria-pressed="false">Left</button>
+          </div>
+          <p id="player-camera-status" class="sr-only" aria-live="polite"></p>
+        </div>
+        <div class="player-transport" role="group" aria-label="Playback controls">
+          <button id="player-play" class="player-control-button" type="button" aria-controls="player" aria-label="Play" title="Play">
+            <span id="player-play-icon" class="player-svg-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" focusable="false">
+                <path class="player-play-glyph" d="M8 5.7v12.6L18 12 8 5.7Z"></path>
+                <path class="player-pause-glyph" d="M7 5h4v14H7V5Zm6 0h4v14h-4V5Z"></path>
+              </svg>
+            </span>
+          </button>
+          <time id="player-current-time" class="player-time" datetime="PT0S">0:00</time>
+          <input id="player-progress" class="player-progress" type="range" min="0" max="0" step="0.1" value="0" aria-controls="player" aria-label="Seek recording" aria-valuetext="0:00">
+          <time id="player-duration" class="player-time" datetime="PT0S">0:00</time>
+          <button id="player-mute" class="player-control-button" type="button" aria-controls="player" aria-label="Mute" title="Mute">
+            <span id="player-mute-icon" class="player-svg-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" focusable="false">
+                <path d="M4 9v6h4l5 4V5L8 9H4Z"></path>
+                <path class="player-volume-waves" d="M16 8.2a5 5 0 0 1 0 7.6M18.6 5.7a8.5 8.5 0 0 1 0 12.6"></path>
+                <path class="player-volume-slash" d="m16 9 5 5m0-5-5 5"></path>
+              </svg>
+            </span>
+          </button>
+          <button id="player-fullscreen" class="player-control-button" type="button" aria-controls="player-stage" aria-label="Enter fullscreen" title="Enter fullscreen">
+            <span class="player-svg-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" focusable="false">
+                <path d="M4 9V4h5M15 4h5v5M20 15v5h-5M9 20H4v-5"></path>
+              </svg>
+            </span>
+          </button>
+        </div>
+      </div>
+      <aside class="player-details">
+        <button id="close-player" class="icon-button player-close" type="button" aria-label="Close">×</button>
+        <p class="eyebrow">ARCHIVED RECORDING</p>
+        <span id="player-kind" class="item-tag replay">Recording</span>
+        <h3 id="player-title">Recording</h3>
+        <p id="player-filename" class="player-filename"></p>
+        <dl class="player-facts">
+          <div><dt>Recorded</dt><dd id="player-recorded">—</dd></div>
+          <div><dt>Vehicle</dt><dd id="player-vehicle">—</dd></div>
+          <div><dt>File size</dt><dd id="player-size">—</dd></div>
+          <div><dt>Integrity</dt><dd id="player-integrity">—</dd></div>
+        </dl>
+        <a id="player-download" class="button primary wide" href="#" download>Download MP4</a>
+      </aside>
+    </div>
+  </dialog>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+</body>
+</html>

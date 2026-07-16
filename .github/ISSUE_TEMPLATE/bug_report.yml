@@ -1,0 +1,102 @@
+name: Bug report
+description: Report reproducible behavior in Overdrive Archive.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for helping improve Overdrive Archive.
+
+        Do not attach recordings, screenshots containing private locations,
+        access codes, tokens, phone numbers, `.env` files, databases, or raw
+        logs. Redact private data before sharing diagnostics.
+
+        Security vulnerabilities must be reported privately through the
+        repository Security tab, not through this form.
+
+  - type: input
+    id: archive-version
+    attributes:
+      label: Overdrive Archive version
+      placeholder: 0.1.0 or commit SHA
+    validations:
+      required: true
+
+  - type: input
+    id: overdrive-version
+    attributes:
+      label: Overdrive version
+      description: Use the version shown by Overdrive. Do not include a device ID.
+      placeholder: Version or commit, if known
+
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Deployment
+      options:
+        - Docker Compose on Linux
+        - NAS Docker environment
+        - Raspberry Pi
+        - Direct Python development run
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area
+      options:
+        - Installation or container startup
+        - Authentication
+        - Vehicle connection
+        - Recording or replay synchronization
+        - Trips, charging, or telemetry
+        - Storage or NAS
+        - Scheduler or Wi-Fi policy
+        - Web interface or playback
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      placeholder: |
+        1. Configure ...
+        2. Start ...
+        3. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Sanitized diagnostics
+      description: Include only the minimal relevant lines after removing private data.
+      render: text
+
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy confirmation
+      options:
+        - label: I removed credentials, personal data, locations, vehicle identifiers, recordings, and private infrastructure details.
+          required: true

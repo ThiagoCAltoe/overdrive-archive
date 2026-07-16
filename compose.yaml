@@ -1,0 +1,75 @@
+name: overdrive-archive
+
+services:
+  storage-init:
+    build:
+      context: .
+    image: overdrive-archive:local
+    user: "0:0"
+    entrypoint: ["python", "-m", "app.storage_init"]
+    restart: "no"
+    environment:
+      ARCHIVE_UID: ${ARCHIVE_UID:-10001}
+      ARCHIVE_GID: ${ARCHIVE_GID:-10001}
+      ARCHIVE_DATA_DIR: /data
+      ARCHIVE_ROOT: /archive
+    volumes:
+      - ${ARCHIVE_DATA_PATH:-./data}:/data
+      # Replace ./archive with an NFS/SMB-mounted NAS path if desired.
+      - ${ARCHIVE_HOST_PATH:-./archive}:/archive
+    network_mode: none
+    read_only: true
+    pids_limit: 32
+    mem_limit: 128m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+
+  archive:
+    build:
+      context: .
+    image: overdrive-archive:local
+    user: "${ARCHIVE_UID:-10001}:${ARCHIVE_GID:-10001}"
+    restart: unless-stopped
+    depends_on:
+      storage-init:
+        condition: service_completed_successfully
+    environment:
+      ARCHIVE_AUTH_LOCAL_ENABLED: ${ARCHIVE_AUTH_LOCAL_ENABLED:-true}
+      ARCHIVE_ADMIN_USERNAME: ${ARCHIVE_ADMIN_USERNAME:-admin}
+      ARCHIVE_ADMIN_PASSWORD: ${ARCHIVE_ADMIN_PASSWORD:-}
+      ARCHIVE_ADMIN_PASSWORD_FILE: ${ARCHIVE_ADMIN_PASSWORD_FILE:-}
+      ARCHIVE_TELEGRAM_BOT_TOKEN: ${ARCHIVE_TELEGRAM_BOT_TOKEN:-}
+      ARCHIVE_TELEGRAM_BOT_TOKEN_FILE: ${ARCHIVE_TELEGRAM_BOT_TOKEN_FILE:-}
+      ARCHIVE_TELEGRAM_CHAT_ID: ${ARCHIVE_TELEGRAM_CHAT_ID:-}
+      ARCHIVE_WHATSAPP_WEBHOOK_URL: ${ARCHIVE_WHATSAPP_WEBHOOK_URL:-}
+      ARCHIVE_WHATSAPP_WEBHOOK_TOKEN: ${ARCHIVE_WHATSAPP_WEBHOOK_TOKEN:-}
+      ARCHIVE_WHATSAPP_WEBHOOK_TOKEN_FILE: ${ARCHIVE_WHATSAPP_WEBHOOK_TOKEN_FILE:-}
+      ARCHIVE_WHATSAPP_RECIPIENT: ${ARCHIVE_WHATSAPP_RECIPIENT:-}
+      ARCHIVE_HOST: 0.0.0.0
+      ARCHIVE_PORT: 8080
+      ARCHIVE_SECURE_COOKIES: ${ARCHIVE_SECURE_COOKIES:-false}
+      ARCHIVE_LOG_LEVEL: ${ARCHIVE_LOG_LEVEL:-INFO}
+      ARCHIVE_MAX_RECORDING_GB: ${ARCHIVE_MAX_RECORDING_GB:-20}
+      ARCHIVE_DEFAULT_SUBDIRECTORY: ${ARCHIVE_DEFAULT_SUBDIRECTORY:-vehicles}
+      TZ: ${TZ:-UTC}
+    ports:
+      - "${ARCHIVE_BIND_ADDRESS:-127.0.0.1}:${ARCHIVE_HTTP_PORT:-8088}:8080"
+    volumes:
+      - ${ARCHIVE_DATA_PATH:-./data}:/data
+      # Replace ./archive with an NFS/SMB-mounted NAS path if desired.
+      - ${ARCHIVE_HOST_PATH:-./archive}:/archive
+    read_only: true
+    pids_limit: ${ARCHIVE_PIDS_LIMIT:-256}
+    mem_limit: ${ARCHIVE_MEMORY_LIMIT:-768m}
+    tmpfs:
+      - /tmp:size=64m,mode=1777,noexec,nosuid
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
