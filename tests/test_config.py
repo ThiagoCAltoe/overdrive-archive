@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 from datetime import datetime, timezone
+from unittest.mock import patch
 
 from app.config import (
     CATEGORIES,
@@ -53,6 +54,17 @@ class SettingsTests(unittest.TestCase):
             settings["retention"]["storage_limit"],
             {"enabled": False, "max_bytes": 0},
         )
+
+    def test_invalid_default_subdirectory_fails_before_startup(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {"ARCHIVE_DEFAULT_SUBDIRECTORY": "../outside"},
+        ):
+            with self.assertRaisesRegex(
+                SettingsError,
+                "ARCHIVE_DEFAULT_SUBDIRECTORY is invalid",
+            ):
+                default_settings()
 
     def test_partial_update_preserves_existing_values(self) -> None:
         current = validate_settings(default_settings())

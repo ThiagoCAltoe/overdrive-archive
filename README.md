@@ -214,8 +214,10 @@ privileged mode and does not mount network filesystems itself.
 
 The container uses UID/GID `10001` by default. If your NAS requires a different
 numeric identity, set `ARCHIVE_UID` and `ARCHIVE_GID` in `.env`. The included
-one-shot initializer validates access before the application starts and prints
-an actionable error if the share is not writable.
+one-shot initializer validates access before the application starts. When the
+configured identity changes or a legacy volume has not been prepared yet, it
+repairs ownership throughout that volume once and records the completed
+migration. It prints an actionable error if the share cannot be prepared.
 
 `ARCHIVE_MAX_RECORDING_GB` limits one incoming recording; it is separate from
 the optional total archive limit configured in the web application. With the
@@ -249,6 +251,9 @@ You can also set the initial web value through:
 ```dotenv
 ARCHIVE_DEFAULT_SUBDIRECTORY=vehicles
 ```
+
+An unsafe value fails startup with a configuration error instead of leaving the
+installation running with a destination that cannot be used.
 
 ## Vehicle profile and model
 
@@ -299,10 +304,12 @@ the codecs supported by that browser and operating system. A file that cannot
 play inline can still be downloaded in its original form.
 
 Both Overdrive `standard` 2×2 and `dashcam` mosaic layouts are supported.
-Per-recording metadata takes priority, followed by the read-only layout
-discovered from Overdrive. Older recordings without layout metadata fall back
-to `standard`. OEM dashcam files are treated as a single-camera source and do
-not display the mosaic selector.
+Per-recording metadata takes priority, followed by the recording or surveillance
+layout shown under **Settings → Vehicle connection**. Those values can be
+imported from Overdrive or selected manually when automatic profile import is
+disabled. Older recordings without layout metadata or a configured layout fall
+back to `standard`. OEM dashcam files are treated as a single-camera source and
+do not display the mosaic selector.
 
 Overdrive PR
 [#153](https://github.com/yash-srivastava/Overdrive-release/pull/153)
@@ -557,7 +564,9 @@ archive/
 
 The **Archive library** opens with the **Recordings** category selected so video
 is not mixed with configuration, telemetry, or other JSON snapshots. **All
-categories** remains available when an operator explicitly selects it.
+categories** remains available when an operator explicitly selects it. Results
+are loaded in ordered pages; **Load more** keeps older recordings accessible
+without making the first library request grow with the complete archive.
 
 ## Local retention and storage limit
 

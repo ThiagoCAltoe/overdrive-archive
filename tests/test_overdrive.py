@@ -490,6 +490,39 @@ class OverdriveClientTests(unittest.TestCase):
         with self.assertRaisesRegex(OverdriveError, "changed while"):
             list(self.client.iter_recordings([], []))
 
+    def test_generic_pagination_continues_when_server_clamps_page_size(self) -> None:
+        available = [{"id": index} for index in range(121)]
+        requested_offsets = []
+
+        def clamped_listing(path, **_kwargs):
+            query = path.partition("?")[2]
+            params = dict(part.split("=", 1) for part in query.split("&"))
+            requested_offsets.append(int(params["offset"]))
+            offset = int(params["offset"])
+            page_size = min(int(params["limit"]), 50)
+            return {"trips": available[offset : offset + page_size]}
+
+        self.client.get_json = Mock(side_effect=clamped_listing)
+
+        result = self.client.fetch_paginated("/api/trips", "trips")
+
+        self.assertEqual(result["trips"], available)
+        self.assertEqual(result["archivedCount"], len(available))
+        self.assertEqual(requested_offsets, [0, 50, 100, 121])
+
+    def test_generic_pagination_never_returns_success_at_safety_limit(self) -> None:
+        self.client.get_json = Mock(return_value={"trips": [{"id": 1}]})
+
+        with self.assertRaisesRegex(OverdriveError, "safe pagination limit"):
+            self.client.fetch_paginated(
+                "/api/trips",
+                "trips",
+                limit=200,
+                max_pages=2,
+            )
+
+        self.assertEqual(self.client.get_json.call_count, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

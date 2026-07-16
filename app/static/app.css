@@ -187,6 +187,7 @@ tbody tr:hover { background: rgba(255, 255, 255, .018); }
 .item-tag.surveillance, .item-tag.proximity { color: var(--amber); border-color: rgba(247, 198, 108, .25); background: rgba(247, 198, 108, .08); }
 
 .library-panel { overflow: hidden; }
+.library-pagination { display: flex; justify-content: center; padding: 0 20px 24px; }
 .library-results-head {
   display: flex; align-items: end; gap: 18px; padding: 24px 24px 18px;
 }

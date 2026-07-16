@@ -5,6 +5,9 @@ import sys
 from pathlib import Path
 
 
+_OWNER_MARKER = ".overdrive-archive-owner"
+
+
 def _numeric_id(name: str, default: int) -> int:
     raw = os.environ.get(name, str(default)).strip()
     try:
@@ -46,18 +49,78 @@ def _can_write_as(path: Path, uid: int, gid: int) -> bool:
     return os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
 
 
+def _owner_marker_matches(path: Path, uid: int, gid: int) -> bool:
+    marker = path / _OWNER_MARKER
+    try:
+        if marker.is_symlink() or not marker.is_file():
+            return False
+        return marker.read_text(encoding="ascii") == f"{uid}:{gid}\n"
+    except (OSError, UnicodeError):
+        return False
+
+
+def _repair_ownership(path: Path, uid: int, gid: int) -> None:
+    if path.is_symlink():
+        raise PermissionError(f"Refusing to prepare symbolic-link storage path {path}.")
+
+    def raise_walk_error(exc: OSError) -> None:
+        raise exc
+
+    for root, directories, filenames in os.walk(
+        path,
+        topdown=True,
+        onerror=raise_walk_error,
+        followlinks=False,
+    ):
+        root_path = Path(root)
+        for name in (*directories, *filenames):
+            os.chown(root_path / name, uid, gid, follow_symlinks=False)
+    os.chown(path, uid, gid, follow_symlinks=False)
+
+
+def _write_owner_marker_as(path: Path, uid: int, gid: int) -> None:
+    pid = os.fork()
+    if pid == 0:
+        marker = path / _OWNER_MARKER
+        temporary = path / f".{_OWNER_MARKER}-{os.getpid()}.part"
+        try:
+            os.setgroups([])
+            os.setgid(gid)
+            os.setuid(uid)
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            descriptor = os.open(temporary, flags, 0o600)
+            try:
+                os.write(descriptor, f"{uid}:{gid}\n".encode("ascii"))
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            os.replace(temporary, marker)
+        except BaseException:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+            os._exit(1)
+        os._exit(0)
+    _, status = os.waitpid(pid, 0)
+    if not (os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0):
+        raise PermissionError(f"Could not write the ownership marker in {path}.")
+
+
 def prepare_path(path: Path, uid: int, gid: int) -> None:
     path.mkdir(parents=True, exist_ok=True)
-    if _can_write_as(path, uid, gid):
+    if _can_write_as(path, uid, gid) and _owner_marker_matches(path, uid, gid):
         print(f"{path}: writable by {uid}:{gid}")
         return
 
     try:
-        os.chown(path, uid, gid)
+        _repair_ownership(path, uid, gid)
     except OSError as exc:
         raise PermissionError(
-            f"{path} is not writable by {uid}:{gid}, and its ownership could "
-            f"not be adjusted: {exc}. Configure ARCHIVE_UID/ARCHIVE_GID to "
+            f"{path} could not be migrated to {uid}:{gid}: {exc}. "
+            "Configure ARCHIVE_UID/ARCHIVE_GID to "
             "match the host or NAS permissions."
         ) from exc
 
@@ -65,6 +128,7 @@ def prepare_path(path: Path, uid: int, gid: int) -> None:
         raise PermissionError(
             f"{path} is still not writable by {uid}:{gid} after ownership setup."
         )
+    _write_owner_marker_as(path, uid, gid)
     print(f"{path}: ownership prepared for {uid}:{gid}")
 
 

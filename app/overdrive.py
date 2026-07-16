@@ -357,9 +357,12 @@ class OverdriveClient:
         max_pages: int = 100,
         extra_params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        if limit < 1 or max_pages < 1:
+            raise OverdriveError("Pagination limits must be positive.")
         offset = 0
         items: list[Any] = []
         last_payload: dict[str, Any] = {}
+        declared_total: int | None = None
         for _ in range(max_pages):
             params = dict(extra_params or {})
             params.update({"limit": limit, "offset": offset})
@@ -370,11 +373,60 @@ class OverdriveClient:
                 raise OverdriveError(
                     f"Vehicle response did not contain a {array_key!r} list."
                 )
-            items.extend(page_items)
-            last_payload = payload
-            if len(page_items) < limit:
+            raw_total = payload.get("totalCount", payload.get("total"))
+            if raw_total is not None:
+                try:
+                    page_total = int(raw_total)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise OverdriveError(
+                        "Vehicle response contained an invalid pagination total."
+                    ) from exc
+                if page_total < 0:
+                    raise OverdriveError(
+                        "Vehicle response contained an invalid pagination total."
+                    )
+                if declared_total is None:
+                    declared_total = page_total
+                elif declared_total != page_total:
+                    raise OverdriveError(
+                        "The vehicle listing changed while it was being read."
+                    )
+
+            raw_has_more = payload.get("hasMore", payload.get("has_more"))
+            if raw_has_more is not None and not isinstance(raw_has_more, bool):
+                raise OverdriveError(
+                    "Vehicle response contained invalid pagination metadata."
+                )
+
+            if page_items:
+                items.extend(page_items)
+                offset += len(page_items)
+                last_payload = payload
+            elif not last_payload:
+                last_payload = payload
+
+            if declared_total is not None and offset > declared_total:
+                raise OverdriveError(
+                    "Vehicle response returned more items than its pagination total."
+                )
+            if not page_items:
+                if declared_total is not None and offset < declared_total:
+                    raise OverdriveError(
+                        "Vehicle response ended before the declared pagination total."
+                    )
                 break
-            offset += len(page_items)
+            if declared_total is not None and offset == declared_total:
+                break
+            if raw_has_more is False:
+                if declared_total is not None and offset < declared_total:
+                    raise OverdriveError(
+                        "Vehicle response ended before the declared pagination total."
+                    )
+                break
+        else:
+            raise OverdriveError(
+                "The vehicle listing exceeded the safe pagination limit."
+            )
         result = dict(last_payload)
         result[array_key] = items
         result["archivedCount"] = len(items)

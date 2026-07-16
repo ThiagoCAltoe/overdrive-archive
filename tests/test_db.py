@@ -5,6 +5,8 @@ import os
 import sqlite3
 import stat
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -80,6 +82,112 @@ class DatabasePermissionTests(unittest.TestCase):
                     "archive-time.json",
                     "milliseconds.mp4",
                 ],
+            )
+
+    def test_library_pages_archived_and_deleted_rows_in_one_stable_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Database(Path(temporary) / "archive.sqlite3")
+            common = {
+                "category": "recordings",
+                "subtype": "drive",
+                "vehicle": "test-vehicle",
+                "relative_path": "vehicles/test-vehicle/item.mp4",
+                "media_type": "video/mp4",
+                "size_bytes": 1,
+                "sha256": "0" * 64,
+                "metadata": {},
+            }
+            for source_key, filename, timestamp in (
+                ("newest", "newest.mp4", 300),
+                ("deleted", "deleted.mp4", 200),
+                ("oldest", "oldest.mp4", 100),
+            ):
+                database.add_item(
+                    source_key=source_key,
+                    filename=filename,
+                    source_timestamp=timestamp,
+                    **common,
+                )
+            deleted = database.get_item_by_source_key("deleted")
+            self.assertTrue(database.delete_archive_item(int(deleted["id"])))
+
+            first = database.list_library_items(limit=2)
+            second = database.list_library_items(limit=2, offset=2)
+
+            self.assertEqual(
+                [item["filename"] for item in first + second],
+                ["newest.mp4", "deleted.mp4", "oldest.mp4"],
+            )
+            self.assertEqual(
+                [bool(item["deleted_local"]) for item in first + second],
+                [False, True, False],
+            )
+
+    def test_partial_settings_updates_are_serialized_with_their_read(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Database(Path(temporary) / "archive.sqlite3")
+            first_inside_transaction = threading.Event()
+            release_first = threading.Event()
+            errors: list[BaseException] = []
+
+            from app.config import validate_settings as real_validate_settings
+
+            def controlled_validation(candidate, current=None):
+                if (
+                    current is not None
+                    and candidate.get("schedule", {}).get("only_wifi") is False
+                ):
+                    first_inside_transaction.set()
+                    if not release_first.wait(2):
+                        raise AssertionError("timed out waiting for concurrent save")
+                return real_validate_settings(candidate, current)
+
+            def save(candidate):
+                try:
+                    database.save_settings(candidate)
+                except BaseException as exc:  # surfaced in the main test thread
+                    errors.append(exc)
+
+            with patch("app.db.validate_settings", side_effect=controlled_validation):
+                first = threading.Thread(
+                    target=save,
+                    args=({"schedule": {"only_wifi": False}},),
+                )
+                second = threading.Thread(
+                    target=save,
+                    args=({"interface": {"language": "pt-BR"}},),
+                )
+                first.start()
+                self.assertTrue(first_inside_transaction.wait(2))
+                second.start()
+                time.sleep(0.05)
+                self.assertTrue(second.is_alive())
+                release_first.set()
+                first.join(2)
+                second.join(2)
+
+            self.assertFalse(first.is_alive())
+            self.assertFalse(second.is_alive())
+            self.assertEqual(errors, [])
+            settings = database.get_settings()
+            self.assertFalse(settings["schedule"]["only_wifi"])
+            self.assertEqual(settings["interface"]["language"], "pt-BR")
+
+    def test_running_syncs_are_finalized_after_an_interrupted_process(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Database(Path(temporary) / "archive.sqlite3")
+            run_id = database.start_run("manual")
+
+            self.assertEqual(database.cancel_interrupted_runs(), 1)
+            self.assertEqual(database.cancel_interrupted_runs(), 0)
+
+            run = database.list_runs(1)[0]
+            self.assertEqual(run["id"], run_id)
+            self.assertEqual(run["status"], "cancelled")
+            self.assertIsNotNone(run["finished_at"])
+            self.assertEqual(
+                run["message"],
+                "Synchronization interrupted by application restart.",
             )
 
 
@@ -245,6 +353,52 @@ class RecordingDownloadJobTests(unittest.TestCase):
             rows["source-c"]["first_seen_at"],
             "2026-07-16T14:00:00+00:00",
         )
+
+    def test_refresh_existing_recording_jobs_updates_without_inserting(self) -> None:
+        with patch("app.db.utc_now", return_value="2026-07-16T13:00:00+00:00"):
+            self.database.remember_recording_download_jobs(
+                "vehicle-one",
+                {
+                    "existing": {
+                        "filename": "event_existing.mp4",
+                        "peakSeverity": "NOTICE",
+                    }
+                },
+                {"existing": "vehicles/one/event_existing.mp4.part"},
+            )
+
+        with patch("app.db.utc_now", return_value="2026-07-16T14:00:00+00:00"):
+            refreshed = self.database.refresh_existing_recording_download_jobs(
+                "vehicle-one",
+                {
+                    "existing": {
+                        "peakSeverity": "ALERT",
+                        "filename": "event_existing.mp4",
+                    },
+                    "unselected-new": {
+                        "filename": "event_unselected.mp4",
+                        "peakSeverity": "ALERT",
+                    },
+                },
+            )
+
+        self.assertEqual(refreshed, {"existing"})
+        jobs = self.database.list_recording_download_jobs("vehicle-one")
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]["source_key"], "existing")
+        self.assertEqual(
+            jobs[0]["item"],
+            {
+                "filename": "event_existing.mp4",
+                "peakSeverity": "ALERT",
+            },
+        )
+        self.assertEqual(
+            jobs[0]["partial_relative_path"],
+            "vehicles/one/event_existing.mp4.part",
+        )
+        self.assertEqual(jobs[0]["first_seen_at"], "2026-07-16T13:00:00+00:00")
+        self.assertEqual(jobs[0]["last_seen_at"], "2026-07-16T14:00:00+00:00")
 
     def test_recording_partial_path_rejects_traversal(self) -> None:
         with self.assertRaisesRegex(ValueError, "partial path"):
@@ -709,6 +863,40 @@ class RestorableRetentionDatabaseTests(unittest.TestCase):
             self.assertEqual(row["remote_size_bytes"], 0)
             self.assertEqual(row["item_json"], "{}")
             self.assertEqual(row["last_seen_at"], row["deleted_at"])
+
+    def test_restart_preserves_remote_missing_tombstone_state(self) -> None:
+        source_key = self.retain_recording(
+            "vehicle-one", "missing-across-restart.mp4", 54321
+        )
+        self.assertEqual(
+            self.database.request_recording_restore(source_key),
+            "vehicle-one",
+        )
+        self.database.remember_recording_download_jobs(
+            "vehicle-one",
+            {
+                source_key: {
+                    "filename": "missing-across-restart.mp4",
+                    "timestamp": 54321,
+                    "size": 100,
+                }
+            },
+        )
+        self.database.reconcile_recording_tombstones("vehicle-one", {})
+
+        reopened = Database(self.database.path)
+
+        with reopened.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT last_seen_at FROM archive_retention_tombstones
+                 WHERE source_key=?
+                """,
+                (source_key,),
+            ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertIsNone(row["last_seen_at"])
+        self.assertIsNone(reopened.request_recording_restore(source_key))
 
     def test_reconcile_updates_live_purges_missing_and_is_vehicle_scoped(self) -> None:
         keep = self.retain_recording(

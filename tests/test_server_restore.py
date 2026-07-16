@@ -30,40 +30,47 @@ class _Database:
             "category": "recordings",
         }
 
-    def list_items(self, **_filters) -> list[dict]:
-        return [
-            {
-                "id": 1,
-                "category": "recordings",
-                "subtype": "drive",
-                "filename": "available.mp4",
-                "relative_path": "vehicles/test/available.mp4",
-                "media_type": "video/mp4",
-                "size_bytes": 10,
-                "source_timestamp": 100,
-                "metadata_json": "{}",
-                "retention_protected": True,
-            }
-        ]
-
-    def list_deleted_recordings(self, **filters) -> list[dict]:
+    def list_library_items(self, **filters) -> list[dict]:
         self.deleted_filters.append(dict(filters))
-        return [
-            {
-                "source_key": "vehicle:test:recording:deleted.mp4:123",
-                "category": "recordings",
-                "subtype": "replay",
-                "vehicle": "test-vehicle",
-                "filename": "deleted.mp4",
-                "source_timestamp": 123,
-                "remote_size_bytes": 456,
-                "deleted_at": "2026-07-16T18:00:00+00:00",
-                "last_seen_at": "2026-07-16T17:00:00+00:00",
-                "restore_requested_at": "",
-                "cleanup_pending": self.cleanup_pending,
-                "internal_value": "must-not-leak",
-            }
-        ]
+        if filters.get("category") == "trips":
+            return []
+        archived = {
+            "id": 1,
+            "source_key": self.archived_item["source_key"],
+            "category": "recordings",
+            "subtype": "drive",
+            "filename": "available.mp4",
+            "relative_path": "vehicles/test/available.mp4",
+            "media_type": "video/mp4",
+            "size_bytes": 10,
+            "source_timestamp": 100,
+            "metadata_json": "{}",
+            "retention_protected": True,
+            "deleted_local": False,
+        }
+        deleted = {
+            "source_key": "vehicle:test:recording:deleted.mp4:123",
+            "category": "recordings",
+            "subtype": "replay",
+            "vehicle": "test-vehicle",
+            "filename": "deleted.mp4",
+            "source_timestamp": 123,
+            "remote_size_bytes": 456,
+            "deleted_at": "2026-07-16T18:00:00+00:00",
+            "last_seen_at": "2026-07-16T17:00:00+00:00",
+            "restore_requested_at": "",
+            "cleanup_pending": self.cleanup_pending,
+            "internal_value": "must-not-leak",
+            "deleted_local": True,
+        }
+        rows = (
+            [deleted]
+            if filters.get("subtype") == "replay"
+            else [deleted, archived]
+        )
+        offset = int(filters.get("offset") or 0)
+        limit = int(filters.get("limit") or 100)
+        return rows[offset : offset + limit]
 
     def recording_subtypes(self) -> list[dict]:
         return []
@@ -178,10 +185,11 @@ class RecordingRestoreServerTests(unittest.TestCase):
             self.database.deleted_filters,
             [
                 {
-                    "category": "recordings",
+                    "category": "",
                     "subtype": "replay",
                     "search": "deleted",
-                    "limit": 25,
+                    "limit": 26,
+                    "offset": 0,
                 }
             ],
         )
@@ -200,11 +208,22 @@ class RecordingRestoreServerTests(unittest.TestCase):
         self.assertNotIn("relative_path", deleted)
         self.assertNotIn("internal_value", deleted)
 
-    def test_items_do_not_query_deleted_recordings_for_other_categories(self) -> None:
+    def test_items_filters_the_unified_library_for_other_categories(self) -> None:
         status, _payload = self._request("GET", "/api/items?category=trips")
 
         self.assertEqual(status, 200)
-        self.assertEqual(self.database.deleted_filters, [])
+        self.assertEqual(
+            self.database.deleted_filters,
+            [
+                {
+                    "category": "trips",
+                    "subtype": "",
+                    "search": "",
+                    "limit": 101,
+                    "offset": 0,
+                }
+            ],
+        )
 
     def test_restore_queues_and_starts_a_sync(self) -> None:
         host, port = self.server.server_address

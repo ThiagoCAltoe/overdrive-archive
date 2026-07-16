@@ -98,15 +98,24 @@ class Database:
 
     @classmethod
     def _backfill_retention_tombstones(
-        cls, conn: sqlite3.Connection
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        backfill_last_seen_at: bool,
     ) -> None:
-        conn.execute(
-            """
-            UPDATE archive_retention_tombstones
-               SET last_seen_at=deleted_at
-             WHERE last_seen_at IS NULL
-            """
-        )
+        if backfill_last_seen_at:
+            # ``NULL`` had no meaning before this column existed, so legacy
+            # tombstones were necessarily last seen when they were deleted.
+            # On current databases NULL deliberately means the remote item has
+            # disappeared; rewriting it on every startup would make a deleted
+            # recording incorrectly restorable again.
+            conn.execute(
+                """
+                UPDATE archive_retention_tombstones
+                   SET last_seen_at=deleted_at
+                 WHERE last_seen_at IS NULL
+                """
+            )
         rows = conn.execute(
             """
             SELECT source_key,vehicle_identity,filename,subtype,
@@ -307,6 +316,7 @@ class Database:
                     "PRAGMA table_info(archive_retention_tombstones)"
                 ).fetchall()
             }
+            backfill_tombstone_last_seen = "last_seen_at" not in tombstone_columns
             tombstone_migrations = {
                 "vehicle_identity": (
                     "TEXT NOT NULL DEFAULT ''"
@@ -375,7 +385,10 @@ class Database:
                     WHERE partial_relative_path<>''
                 """
             )
-            self._backfill_retention_tombstones(conn)
+            self._backfill_retention_tombstones(
+                conn,
+                backfill_last_seen_at=backfill_tombstone_last_seen,
+            )
             row = conn.execute("SELECT 1 FROM settings WHERE id=1").fetchone()
             if row is None:
                 payload = json.dumps(default_settings(), separators=(",", ":"))
@@ -396,10 +409,27 @@ class Database:
             return default_settings()
 
     def save_settings(self, candidate: dict[str, Any]) -> dict[str, Any]:
-        current = self.get_settings()
-        normalized = validate_settings(candidate, current)
-        payload = json.dumps(normalized, separators=(",", ":"), sort_keys=True)
         with self.connect() as conn:
+            # Partial settings updates are read/merged/written under one writer
+            # transaction. Otherwise a profile refresh and a simultaneous UI
+            # save can both merge against the same stale snapshot and the last
+            # commit silently discards the other update.
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT payload FROM settings WHERE id=1"
+            ).fetchone()
+            current = default_settings()
+            if row is not None:
+                try:
+                    current = validate_settings(json.loads(row["payload"]))
+                except (json.JSONDecodeError, ValueError, TypeError):
+                    current = default_settings()
+            normalized = validate_settings(candidate, current)
+            payload = json.dumps(
+                normalized,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
             conn.execute(
                 """
                 INSERT INTO settings(id,payload,updated_at) VALUES(1,?,?)
@@ -409,6 +439,20 @@ class Database:
                 (payload, utc_now()),
             )
         return normalized
+
+    def cancel_interrupted_runs(self) -> int:
+        """Finalize runs left active by an earlier process termination."""
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE sync_runs
+                   SET status='cancelled', finished_at=?,
+                       message='Synchronization interrupted by application restart.'
+                 WHERE status='running'
+                """,
+                (utc_now(),),
+            )
+        return cursor.rowcount
 
     def start_run(self, reason: str) -> int:
         with self.connect() as conn:
@@ -684,6 +728,78 @@ class Database:
                 ),
             )
         return set(existing)
+
+    def refresh_existing_recording_download_jobs(
+        self,
+        vehicle_identity: str,
+        jobs: Mapping[str, dict[str, Any]],
+    ) -> set[str]:
+        """Refresh listed jobs without creating queue entries for new sources."""
+        identity = self._recording_job_identity(
+            vehicle_identity, "Vehicle identity"
+        )
+        if not isinstance(jobs, Mapping):
+            raise ValueError("Recording download jobs must be a mapping.")
+
+        prepared: list[tuple[str, str]] = []
+        for raw_source_key, item in jobs.items():
+            source_key = self._recording_job_identity(
+                raw_source_key, "Source key"
+            )
+            prepared.append(
+                (source_key, self._canonical_recording_job_json(item))
+            )
+        if not prepared:
+            return set()
+
+        source_keys = {source_key for source_key, _payload in prepared}
+        seen_at = utc_now()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing: dict[str, str] = {}
+            ordered_keys = sorted(source_keys)
+            for offset in range(0, len(ordered_keys), 500):
+                chunk = ordered_keys[offset : offset + 500]
+                placeholders = ",".join("?" for _key in chunk)
+                rows = conn.execute(
+                    f"""
+                    SELECT source_key, vehicle_identity
+                      FROM recording_download_jobs
+                     WHERE source_key IN ({placeholders})
+                    """,
+                    chunk,
+                ).fetchall()
+                existing.update(
+                    {
+                        str(row["source_key"]): str(row["vehicle_identity"])
+                        for row in rows
+                    }
+                )
+
+            mismatched = sorted(
+                source_key
+                for source_key, stored_identity in existing.items()
+                if stored_identity != identity
+            )
+            if mismatched:
+                raise ValueError(
+                    "A recording download source key belongs to another vehicle."
+                )
+
+            matching = set(existing)
+            conn.executemany(
+                """
+                UPDATE recording_download_jobs
+                   SET item_json=?, last_seen_at=?
+                 WHERE source_key=? AND vehicle_identity=?
+                """,
+                (
+                    (payload, seen_at, source_key, identity)
+                    for source_key, payload in prepared
+                    if source_key in matching
+                ),
+            )
+        return matching
 
     def list_recording_download_jobs(
         self, vehicle_identity: str
@@ -1627,6 +1743,100 @@ class Database:
                  LIMIT ?
                 """,
                 args,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_library_items(
+        self,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        category: str = "",
+        subtype: str = "",
+        search: str = "",
+    ) -> list[dict[str, Any]]:
+        """Page stored items and local-deletion placeholders in one ordering."""
+        limit = max(1, min(int(limit), 251))
+        offset = max(0, min(int(offset), 1_000_000))
+        clauses: list[str] = []
+        arguments: list[Any] = []
+        if category:
+            clauses.append("category=?")
+            arguments.append(category)
+        if subtype:
+            clauses.append("subtype=?")
+            arguments.append(subtype)
+        if search:
+            escaped = (
+                search.replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_")
+            )
+            clauses.append(
+                "(filename LIKE ? ESCAPE '\\' OR vehicle LIKE ? ESCAPE '\\')"
+            )
+            arguments.extend((f"%{escaped}%", f"%{escaped}%"))
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        arguments.extend((limit, offset))
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                WITH library AS (
+                    SELECT id,source_key,category,subtype,vehicle,filename,
+                           relative_path,media_type,size_bytes,sha256,
+                           source_timestamp,metadata_json,created_at,
+                           0 AS deleted_local,0 AS remote_size_bytes,
+                           '' AS deleted_at,'' AS last_seen_at,
+                           '' AS restore_requested_at,0 AS cleanup_pending,
+                           EXISTS(
+                               SELECT 1
+                                 FROM archive_retention_protections AS protection
+                                WHERE protection.source_key=archive_items.source_key
+                           ) AS retention_protected,
+                           CASE
+                               WHEN source_timestamp IS NULL OR source_timestamp<=0
+                                   THEN CAST(strftime('%s', created_at) AS INTEGER) * 1000
+                               WHEN source_timestamp<10000000000
+                                   THEN source_timestamp * 1000
+                               ELSE source_timestamp
+                           END AS sort_timestamp,
+                           'local:' || printf('%020d', id) AS sort_key
+                      FROM archive_items
+                    UNION ALL
+                    SELECT NULL AS id,source_key,category,subtype,vehicle,filename,
+                           '' AS relative_path,'' AS media_type,0 AS size_bytes,
+                           '' AS sha256,source_timestamp,'{{}}' AS metadata_json,
+                           deleted_at AS created_at,1 AS deleted_local,
+                           remote_size_bytes,deleted_at,
+                           COALESCE(last_seen_at, '') AS last_seen_at,
+                           COALESCE(restore_requested_at, '') AS restore_requested_at,
+                           EXISTS(
+                               SELECT 1
+                                 FROM archive_retention_deletion_jobs AS job
+                                WHERE job.source_key=tombstone.source_key
+                           ) AS cleanup_pending,
+                           0 AS retention_protected,
+                           CASE
+                               WHEN source_timestamp IS NULL OR source_timestamp<=0
+                                   THEN CAST(strftime('%s', deleted_at) AS INTEGER) * 1000
+                               WHEN source_timestamp<10000000000
+                                   THEN source_timestamp * 1000
+                               ELSE source_timestamp
+                           END AS sort_timestamp,
+                           'deleted:' || source_key AS sort_key
+                      FROM archive_retention_tombstones AS tombstone
+                )
+                SELECT id,source_key,category,subtype,vehicle,filename,
+                       relative_path,media_type,size_bytes,sha256,
+                       source_timestamp,metadata_json,created_at,deleted_local,
+                       remote_size_bytes,deleted_at,last_seen_at,
+                       restore_requested_at,cleanup_pending,retention_protected
+                  FROM library
+                  {where}
+                 ORDER BY sort_timestamp DESC, filename DESC, sort_key DESC
+                 LIMIT ? OFFSET ?
+                """,
+                arguments,
             ).fetchall()
         return [dict(row) for row in rows]
 

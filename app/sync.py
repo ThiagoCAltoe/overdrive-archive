@@ -91,6 +91,8 @@ _CONFIG_SCALAR_KEYS = {
     "version",
 }
 _POLICY_RETRY_SECONDS = 5 * 60
+_RECORDING_CATALOG_MAX_ITEMS = 50_000
+_RECORDING_CATALOG_MAX_METADATA_BYTES = 64 * 1024 * 1024
 
 
 class PolicyPause(OverdriveError):
@@ -268,6 +270,12 @@ class SyncEngine:
         self._last_retention_check = 0.0
         self._observed_vehicle_connection = ""
         self._observed_vehicle_identity = ""
+        interrupted_runs = self.db.cancel_interrupted_runs()
+        if interrupted_runs:
+            log.warning(
+                "Marked %s synchronization run(s) as interrupted after restart",
+                interrupted_runs,
+            )
         self._recover_retention_deletions()
 
     def start_scheduler(self) -> None:
@@ -286,6 +294,14 @@ class SyncEngine:
         scheduler = self._scheduler_thread
         if scheduler is not None and scheduler is not threading.current_thread():
             scheduler.join()
+        # A cancellation request is cooperative. Keep the process alive until
+        # the worker has crossed a checkpoint and finalized its sync_runs row;
+        # otherwise a normal SIGTERM can leave a durable "running" entry and a
+        # half-finished state even though shutdown was graceful.
+        with self._state_lock:
+            sync_worker = self._sync_thread
+        if sync_worker is not None and sync_worker is not threading.current_thread():
+            sync_worker.join()
         # Retention moves files and commits a durable journal. Let an active
         # operation reach a recoverable boundary before the process exits.
         self._retention_lock.acquire()
@@ -694,119 +710,161 @@ class SyncEngine:
                 return {"status": "deferred", "deleted_items": 0, "deleted_bytes": 0}
             self._retention_active = True
         try:
-            recovery_errors = self._recover_retention_deletions()
-            settings = settings or self.db.get_settings()
-            retention = settings["retention"]
-            category_rules = retention["categories"]
-            storage_rule = retention["storage_limit"]
-            if not storage_rule["enabled"] and not any(
-                rule["enabled"] for rule in category_rules.values()
-            ):
-                return {
-                    "status": "partial" if recovery_errors else "disabled",
-                    "deleted_items": 0,
-                    "deleted_bytes": 0,
-                    "error_count": recovery_errors,
-                }
-
-            # Keep-latest is a rank across the complete local category. A
-            # manually pinned item can occupy one of those newest slots while
-            # remaining independently protected from every deletion policy.
-            candidates = self.db.list_retention_candidates(include_protected=True)
-            manually_protected = self.db.list_retention_protected_source_keys()
-            protected_ids: set[int] = {
-                int(item["id"])
-                for item in candidates
-                if str(item["source_key"]) in manually_protected
-            }
-            for category, rule in category_rules.items():
-                if not rule["keep_latest_enabled"]:
-                    continue
-                category_items = [
-                    item for item in candidates if item["category"] == category
-                ]
-                category_items.sort(
-                    key=self._retention_item_sort_key,
-                    reverse=True,
-                )
-                protected_ids.update(
-                    int(item["id"])
-                    for item in category_items[: int(rule["keep_latest_count"])]
-                )
-
-            now = datetime.now(timezone.utc)
-            deleted_ids: set[int] = set()
-            deleted_items = 0
-            deleted_bytes = 0
-            error_count = recovery_errors
-
-            for item in candidates:
-                self._check_cancelled()
-                item_id = int(item["id"])
-                rule = category_rules.get(str(item["category"]))
-                if not rule or not rule["enabled"] or item_id in protected_ids:
-                    continue
-                seconds = int(rule["value"]) * {
-                    "minutes": 60,
-                    "hours": 3600,
-                    "days": 86400,
-                }[rule["unit"]]
-                try:
-                    cutoff = now - timedelta(seconds=seconds)
-                except OverflowError:
-                    # A valid, very large policy can reach farther back than
-                    # datetime.min. Saturating means every representable item
-                    # is correctly considered inside the retention window.
-                    cutoff = datetime.min.replace(tzinfo=timezone.utc)
-                if self._retention_item_datetime(item) >= cutoff:
-                    continue
-                deleted, freed, cleanup_error = self._delete_local_archive_item(item)
-                if deleted:
-                    deleted_ids.add(item_id)
-                    deleted_items += 1
-                    deleted_bytes += freed
-                if cleanup_error:
-                    error_count += 1
-
-            usage = self._archive_usage_bytes()
-            limit = int(storage_rule["max_bytes"]) if storage_rule["enabled"] else 0
-            if limit and usage > limit:
-                quota_candidates = [
-                    item
-                    for item in candidates
-                    if int(item["id"]) not in deleted_ids
-                    and int(item["id"]) not in protected_ids
-                ]
-                quota_candidates.sort(key=self._retention_item_sort_key)
-                for item in quota_candidates:
-                    self._check_cancelled()
-                    if usage <= limit:
-                        break
-                    deleted, freed, cleanup_error = self._delete_local_archive_item(item)
-                    if deleted:
-                        deleted_ids.add(int(item["id"]))
-                        deleted_items += 1
-                        deleted_bytes += freed
-                        usage = max(0, usage - freed)
-                    if cleanup_error:
-                        error_count += 1
-
-            final_usage = self._archive_usage_bytes()
-            satisfied = not limit or final_usage <= limit
-            return {
-                "status": "complete" if error_count == 0 else "partial",
-                "deleted_items": deleted_items,
-                "deleted_bytes": deleted_bytes,
-                "error_count": error_count,
-                "usage_bytes": final_usage,
-                "limit_bytes": limit,
-                "limit_satisfied": satisfied,
-                "protected_items": len(protected_ids),
-            }
+            # Callers can reach this method with a snapshot loaded before they
+            # acquired the retention lock. Never let that stale snapshot run
+            # after a newer settings request has completed.
+            current_settings = self.db.get_settings()
+            if settings is None or settings != current_settings:
+                settings = current_settings
+            return self._apply_retention_locked(settings)
         finally:
             with self._state_lock:
                 self._retention_active = False
             self._retention_lock.release()
+
+    def update_settings_and_apply_retention(
+        self,
+        update: Callable[[], dict[str, Any]],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Serialize one settings save with the retention policy it enables."""
+        self._retention_lock.acquire()
+        owns_retention_slot = False
+        try:
+            with self._state_lock:
+                active_elsewhere = (
+                    self._active
+                    and threading.current_thread() is not self._sync_thread
+                )
+                if not self._scheduler_stop.is_set() and not active_elsewhere:
+                    self._retention_active = True
+                    owns_retention_slot = True
+
+            saved = update()
+            if not owns_retention_slot:
+                return saved, {
+                    "status": "deferred",
+                    "deleted_items": 0,
+                    "deleted_bytes": 0,
+                }
+            return saved, self._apply_retention_locked(saved)
+        finally:
+            if owns_retention_slot:
+                with self._state_lock:
+                    self._retention_active = False
+            self._retention_lock.release()
+
+    def _apply_retention_locked(
+        self,
+        settings: dict[str, Any],
+    ) -> dict[str, Any]:
+        recovery_errors = self._recover_retention_deletions()
+        retention = settings["retention"]
+        category_rules = retention["categories"]
+        storage_rule = retention["storage_limit"]
+        if not storage_rule["enabled"] and not any(
+            rule["enabled"] for rule in category_rules.values()
+        ):
+            return {
+                "status": "partial" if recovery_errors else "disabled",
+                "deleted_items": 0,
+                "deleted_bytes": 0,
+                "error_count": recovery_errors,
+            }
+
+        # Keep-latest is a rank across the complete local category. A
+        # manually pinned item can occupy one of those newest slots while
+        # remaining independently protected from every deletion policy.
+        candidates = self.db.list_retention_candidates(include_protected=True)
+        manually_protected = self.db.list_retention_protected_source_keys()
+        protected_ids: set[int] = {
+            int(item["id"])
+            for item in candidates
+            if str(item["source_key"]) in manually_protected
+        }
+        for category, rule in category_rules.items():
+            if not rule["keep_latest_enabled"]:
+                continue
+            category_items = [
+                item for item in candidates if item["category"] == category
+            ]
+            category_items.sort(
+                key=self._retention_item_sort_key,
+                reverse=True,
+            )
+            protected_ids.update(
+                int(item["id"])
+                for item in category_items[: int(rule["keep_latest_count"])]
+            )
+
+        now = datetime.now(timezone.utc)
+        deleted_ids: set[int] = set()
+        deleted_items = 0
+        deleted_bytes = 0
+        error_count = recovery_errors
+
+        for item in candidates:
+            self._check_cancelled()
+            item_id = int(item["id"])
+            rule = category_rules.get(str(item["category"]))
+            if not rule or not rule["enabled"] or item_id in protected_ids:
+                continue
+            seconds = int(rule["value"]) * {
+                "minutes": 60,
+                "hours": 3600,
+                "days": 86400,
+            }[rule["unit"]]
+            try:
+                cutoff = now - timedelta(seconds=seconds)
+            except OverflowError:
+                # A valid, very large policy can reach farther back than
+                # datetime.min. Saturating means every representable item
+                # is correctly considered inside the retention window.
+                cutoff = datetime.min.replace(tzinfo=timezone.utc)
+            if self._retention_item_datetime(item) >= cutoff:
+                continue
+            deleted, freed, cleanup_error = self._delete_local_archive_item(item)
+            if deleted:
+                deleted_ids.add(item_id)
+                deleted_items += 1
+                deleted_bytes += freed
+            if cleanup_error:
+                error_count += 1
+
+        usage = self._archive_usage_bytes()
+        limit = int(storage_rule["max_bytes"]) if storage_rule["enabled"] else 0
+        if limit and usage > limit:
+            quota_candidates = [
+                item
+                for item in candidates
+                if int(item["id"]) not in deleted_ids
+                and int(item["id"]) not in protected_ids
+            ]
+            quota_candidates.sort(key=self._retention_item_sort_key)
+            for item in quota_candidates:
+                self._check_cancelled()
+                if usage <= limit:
+                    break
+                deleted, freed, cleanup_error = self._delete_local_archive_item(item)
+                if deleted:
+                    deleted_ids.add(int(item["id"]))
+                    deleted_items += 1
+                    deleted_bytes += freed
+                    usage = max(0, usage - freed)
+                if cleanup_error:
+                    error_count += 1
+
+        final_usage = self._archive_usage_bytes()
+        satisfied = not limit or final_usage <= limit
+        return {
+            "status": "complete" if error_count == 0 else "partial",
+            "deleted_items": deleted_items,
+            "deleted_bytes": deleted_bytes,
+            "error_count": error_count,
+            "usage_bytes": final_usage,
+            "limit_bytes": limit,
+            "limit_satisfied": satisfied,
+            "protected_items": len(protected_ids),
+        }
 
     @staticmethod
     def _retention_item_datetime(item: dict[str, Any]) -> datetime:
@@ -2236,52 +2294,70 @@ class SyncEngine:
         vehicle = self._vehicle_slug(settings)
         identity = self._vehicle_identity(settings)
         self._destination_base(settings)
-        policy_check = self._download_policy_check(client, settings)
+        policy_check = self._download_policy_check(client)
         selected_types = set(content["recording_types"])
         selected_severities = set(content["severities"])
         include_unknown = content["include_unknown_recording_types"]
 
         self._set_state(stage="discovering", current="Building a fixed recording queue")
-        remote_items: list[dict[str, Any]] = []
+        all_live_jobs: dict[str, dict[str, Any]] = {}
         seen_filenames: set[str] = set()
+        catalog_metadata_bytes = 0
         for item in client.iter_recordings([], []):
             self._check_cancelled()
-            filename = self._safe_filename(item.get("filename"))
+            if len(all_live_jobs) >= _RECORDING_CATALOG_MAX_ITEMS:
+                raise OverdriveError(
+                    "Recording catalog exceeded the safe item limit."
+                )
+            snapshot = dict(item)
+            filename = self._safe_filename(snapshot.get("filename"))
             if filename in seen_filenames:
                 raise OverdriveError(
                     "Recordings API returned a duplicate filename."
                 )
-            seen_filenames.add(filename)
-            remote_items.append(dict(item))
-        self._check_cancelled()
-        all_live_jobs: dict[str, dict[str, Any]] = {}
-        all_live_partial_paths: dict[str, str] = {}
-        for item in remote_items:
-            filename = self._safe_filename(item.get("filename"))
             try:
-                timestamp_ms = max(0, int(item.get("timestamp") or 0))
+                encoded_metadata = json.dumps(
+                    snapshot,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+            except (OverflowError, RecursionError, TypeError, ValueError) as exc:
+                raise OverdriveError(
+                    "Vehicle returned invalid recording metadata."
+                ) from exc
+            item_metadata_bytes = len(encoded_metadata)
+            if (
+                item_metadata_bytes > _RECORDING_CATALOG_MAX_METADATA_BYTES
+                or catalog_metadata_bytes
+                > _RECORDING_CATALOG_MAX_METADATA_BYTES - item_metadata_bytes
+            ):
+                raise OverdriveError(
+                    "Recording catalog metadata exceeded the safe memory limit."
+                )
+            try:
+                timestamp_ms = max(0, int(snapshot.get("timestamp") or 0))
             except (TypeError, ValueError) as exc:
                 raise OverdriveError("Vehicle returned invalid recording metadata.") from exc
             source_key = f"{identity}:recording:{filename}:{timestamp_ms}"
-            all_live_jobs[source_key] = dict(item)
-            _name, _subtype, _timestamp, _relative, final_path = (
-                self._recording_archive_path(
-                    settings,
-                    item,
-                    identity=identity,
-                    vehicle=vehicle,
-                )
-            )
-            partial_path = final_path.with_suffix(final_path.suffix + ".part")
-            all_live_partial_paths[source_key] = str(
-                partial_path.relative_to(self.archive_root.resolve())
-            )
+            seen_filenames.add(filename)
+            catalog_metadata_bytes += item_metadata_bytes
+            all_live_jobs[source_key] = snapshot
+        self._check_cancelled()
 
         # Reconcile deleted-local placeholders only after every API page was
         # fetched successfully. A timeout or partial listing never implies that
         # a recording disappeared from the vehicle.
         self.db.reconcile_recording_tombstones(identity, all_live_jobs)
+        # A queued retry keeps its durable identity/path, but every successful
+        # listing refreshes its mutable metadata before policy filtering. This
+        # update-only pass must not enqueue newly discovered unselected items.
+        self.db.refresh_existing_recording_download_jobs(
+            identity, all_live_jobs
+        )
         live_jobs: dict[str, dict[str, Any]] = {}
+        live_partial_paths: dict[str, str] = {}
         for source_key, item in all_live_jobs.items():
             restore_requested = (
                 self.db.recording_restore_requested(source_key)
@@ -2296,13 +2372,25 @@ class SyncEngine:
                     include_unknown,
                 )
             ):
-                live_jobs[source_key] = dict(item)
+                live_jobs[source_key] = item
+                _name, _subtype, _timestamp, _relative, final_path = (
+                    self._recording_archive_path(
+                        settings,
+                        item,
+                        identity=identity,
+                        vehicle=vehicle,
+                    )
+                )
+                partial_path = final_path.with_suffix(final_path.suffix + ".part")
+                live_partial_paths[source_key] = str(
+                    partial_path.relative_to(self.archive_root.resolve())
+                )
 
         known_live_keys = self.db.remember_recording_download_jobs(
             identity,
             live_jobs,
             {
-                source_key: all_live_partial_paths[source_key]
+                source_key: live_partial_paths[source_key]
                 for source_key in live_jobs
             },
         )
@@ -3091,7 +3179,6 @@ class SyncEngine:
     def _download_policy_check(
         self,
         client: OverdriveClient,
-        settings: dict[str, Any],
     ) -> Callable[[], None]:
         last_check = 0.0
 
@@ -3104,8 +3191,10 @@ class SyncEngine:
             last_check = now
             status = client.status()
             network = status.get("network")
+            current_settings = self.db.get_settings()
             allowed, message = wifi_policy(
-                settings, network if isinstance(network, dict) else {}
+                current_settings,
+                network if isinstance(network, dict) else {},
             )
             if not allowed:
                 raise PolicyPause(message)

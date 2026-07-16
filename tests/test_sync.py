@@ -354,6 +354,119 @@ class SyncEngineTests(unittest.TestCase):
         self.engine._collect_recordings(client, settings, RunTotals())
         self.assertEqual(client.downloads, [discovered_late["filename"]])
 
+    def test_recording_catalog_item_limit_rejects_before_queue_mutation(
+        self,
+    ) -> None:
+        settings = self._recording_settings()
+        items = [
+            {
+                "filename": f"cam_catalog_item_{index}.mp4",
+                "type": "normal",
+                "timestamp": RECORDING_TIMESTAMP + index,
+                "size": 1,
+            }
+            for index in range(3)
+        ]
+        client = QueueRecordingClient(items)
+
+        with patch("app.sync._RECORDING_CATALOG_MAX_ITEMS", 2):
+            with self.assertRaisesRegex(OverdriveError, "safe item limit"):
+                self.engine._collect_recordings(client, settings, RunTotals())
+
+        self.assertEqual(client.downloads, [])
+        self.assertEqual(
+            self.db.list_recording_download_jobs(
+                self.engine._vehicle_identity(settings)
+            ),
+            [],
+        )
+        self.assertEqual(self.db.list_items(category="recordings"), [])
+
+    def test_recording_catalog_accepts_exact_item_and_metadata_limits(
+        self,
+    ) -> None:
+        settings = self._recording_settings()
+        items = [
+            {
+                "filename": f"cam_catalog_boundary_{index}.mp4",
+                "type": "normal",
+                "timestamp": RECORDING_TIMESTAMP + index,
+                "size": 1,
+            }
+            for index in range(2)
+        ]
+        metadata_bytes = sum(
+            len(
+                json.dumps(
+                    item,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+            )
+            for item in items
+        )
+        client = QueueRecordingClient(items)
+
+        with (
+            patch("app.sync._RECORDING_CATALOG_MAX_ITEMS", len(items)),
+            patch(
+                "app.sync._RECORDING_CATALOG_MAX_METADATA_BYTES",
+                metadata_bytes,
+            ),
+        ):
+            self.engine._collect_recordings(client, settings, RunTotals())
+
+        self.assertEqual(
+            client.downloads,
+            [item["filename"] for item in items],
+        )
+
+    def test_recording_catalog_metadata_limit_is_aggregate(self) -> None:
+        settings = self._recording_settings()
+        items = [
+            {
+                "filename": f"cam_catalog_metadata_{index}.mp4",
+                "type": "normal",
+                "timestamp": RECORDING_TIMESTAMP + index,
+                "size": 1,
+                "metadata": "x" * 16,
+            }
+            for index in range(2)
+        ]
+        encoded_sizes = [
+            len(
+                json.dumps(
+                    item,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+            )
+            for item in items
+        ]
+        aggregate_limit = max(encoded_sizes)
+        self.assertLess(aggregate_limit, sum(encoded_sizes))
+        client = QueueRecordingClient(items)
+
+        with patch(
+            "app.sync._RECORDING_CATALOG_MAX_METADATA_BYTES",
+            aggregate_limit,
+        ):
+            with self.assertRaisesRegex(OverdriveError, "safe memory limit"):
+                self.engine._collect_recordings(client, settings, RunTotals())
+
+        self.assertEqual(client.downloads, [])
+        self.assertEqual(
+            self.db.list_recording_download_jobs(
+                self.engine._vehicle_identity(settings)
+            ),
+            [],
+        )
+        self.assertEqual(self.db.list_items(category="recordings"), [])
+
     def test_complete_listing_removes_a_backlog_job_missing_from_vehicle(self) -> None:
         settings = self._recording_settings()
         identity = self.engine._vehicle_identity(settings)
@@ -1737,6 +1850,58 @@ class SyncEngineTests(unittest.TestCase):
         )
         self.assertEqual([job["item"]["filename"] for job in jobs], [blocked["filename"]])
 
+    def test_existing_job_uses_fresh_metadata_before_selection(self) -> None:
+        self._recording_settings()
+        settings = self.db.save_settings(
+            {
+                "content": {
+                    "recording_types": ["sentry"],
+                    "severities": ["NOTICE"],
+                }
+            }
+        )
+        notice = {
+            "filename": "event_20260716_090000.mp4",
+            "type": "sentry",
+            "peakSeverity": "NOTICE",
+            "timestamp": RECORDING_TIMESTAMP,
+            "size": 10,
+        }
+
+        class FailingNoticeClient(QueueRecordingClient):
+            def download_to(self, path, destination, **kwargs):
+                self.downloads.append(Path(path).name)
+                raise OverdriveError("notice unavailable for test")
+
+        with self.assertRaisesRegex(OverdriveError, "remain queued"):
+            self.engine._collect_recordings(
+                FailingNoticeClient([notice]), settings, RunTotals()
+            )
+
+        changed = {**notice, "peakSeverity": "ALERT"}
+        unselected_new = {
+            **changed,
+            "filename": "event_20260716_091000.mp4",
+            "timestamp": RECORDING_TIMESTAMP + 1_000,
+        }
+        current_client = QueueRecordingClient([changed, unselected_new])
+        self.engine._collect_recordings(
+            current_client, settings, RunTotals()
+        )
+
+        self.assertEqual(current_client.downloads, [])
+        self.assertEqual(self.db.list_items(category="recordings"), [])
+        identity = self.engine._vehicle_identity(settings)
+        jobs = self.db.list_recording_download_jobs(identity)
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]["item"]["filename"], notice["filename"])
+        self.assertEqual(jobs[0]["item"]["peakSeverity"], "ALERT")
+        self.assertFalse(
+            self.engine._recording_is_selected(
+                jobs[0]["item"], {"sentry"}, {"NOTICE"}, False
+            )
+        )
+
     def test_stop_is_cooperative_preserves_part_and_resets_for_next_run(self) -> None:
         settings = self._recording_settings()
         self.db.save_settings(
@@ -1806,6 +1971,61 @@ class SyncEngineTests(unittest.TestCase):
 
     def test_stop_returns_false_while_idle(self) -> None:
         self.assertFalse(self.engine.request_stop())
+
+    def test_shutdown_waits_for_the_active_sync_worker(self) -> None:
+        started = threading.Event()
+        cancelled = threading.Event()
+
+        def cooperative_run(_reason):
+            started.set()
+            while True:
+                try:
+                    self.engine._check_cancelled()
+                except SyncCancelled:
+                    cancelled.set()
+                    return {"status": "cancelled"}
+                threading.Event().wait(0.01)
+
+        with patch.object(self.engine, "run_once", side_effect=cooperative_run):
+            self.assertTrue(self.engine.trigger("manual"))
+            self.assertTrue(started.wait(2))
+            worker = self.engine._sync_thread
+            self.assertIsNotNone(worker)
+
+            self.engine.stop()
+
+        self.assertTrue(cancelled.is_set())
+        self.assertFalse(worker.is_alive())
+        self.assertFalse(self.engine.state()["active"])
+
+    def test_new_engine_finalizes_a_run_interrupted_before_restart(self) -> None:
+        run_id = self.db.start_run("manual")
+
+        SyncEngine(self.db, self.engine.archive_root)
+
+        run = self.db.list_runs(1)[0]
+        self.assertEqual(run["id"], run_id)
+        self.assertEqual(run["status"], "cancelled")
+        self.assertEqual(
+            run["message"],
+            "Synchronization interrupted by application restart.",
+        )
+
+    def test_download_policy_uses_latest_saved_wifi_setting(self) -> None:
+        settings = self._recording_settings()
+        settings = self.db.save_settings({"schedule": {"only_wifi": False}})
+
+        class CellularClient:
+            @staticmethod
+            def status():
+                return {"network": {"type": "cellular"}}
+
+        policy_check = self.engine._download_policy_check(CellularClient())
+        with patch("app.sync.time.monotonic", side_effect=[31.0, 62.0]):
+            policy_check()
+            self.db.save_settings({"schedule": {"only_wifi": True}})
+            with self.assertRaisesRegex(OverdriveError, "waiting for Wi-Fi"):
+                policy_check()
 
     def test_missing_inventory_file_is_downloaded_again(self) -> None:
         settings = self._recording_settings()

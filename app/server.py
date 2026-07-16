@@ -10,7 +10,6 @@ import signal
 import shutil
 import stat
 import threading
-from datetime import datetime, timezone
 from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -28,6 +27,7 @@ from .auth import (
 from .config import (
     SettingsError,
     base_url_origin,
+    default_settings,
     discovered_vehicle_changes,
     redact_settings,
     validate_settings,
@@ -496,64 +496,54 @@ class Handler(BaseHTTPRequestHandler):
                 limit = int((query.get("limit") or ["100"])[0])
             except ValueError:
                 limit = 100
+            try:
+                offset = int((query.get("offset") or ["0"])[0])
+            except ValueError:
+                offset = 0
             limit = max(1, min(limit, 250))
-            items = self.server.db.list_items(
-                limit=limit,
+            offset = max(0, min(offset, 1_000_000))
+            page = self.server.db.list_library_items(
+                limit=limit + 1,
+                offset=offset,
                 category=category,
                 subtype=subtype,
                 search=search,
             )
-            for item in items:
+            has_more = len(page) > limit
+            items: list[dict[str, Any]] = []
+            for item in page[:limit]:
+                if item.get("deleted_local"):
+                    items.append(self._deleted_recording_placeholder(item))
+                    continue
                 item["retention_protected"] = bool(
                     item.get("retention_protected")
                 )
                 item["camera_layout"] = self._camera_layout(item)
                 item.pop("metadata_json", None)
+                item.pop("source_key", None)
+                item.pop("deleted_local", None)
+                item.pop("remote_size_bytes", None)
+                item.pop("deleted_at", None)
+                item.pop("last_seen_at", None)
+                item.pop("restore_requested_at", None)
+                item.pop("cleanup_pending", None)
                 item["thumbnail_url"] = (
                     f"/thumbnail/{item['id']}"
                     if self._thumbnail_path(item) is not None
                     else None
                 )
-            if category in {"", "recordings"}:
-                deleted = self.server.db.list_deleted_recordings(
-                    category="recordings",
-                    subtype=subtype,
-                    search=search,
-                    limit=limit,
-                )
-                items.extend(
-                    self._deleted_recording_placeholder(item) for item in deleted
-                )
-            items.sort(key=self._archive_item_sort_key, reverse=True)
-            items = items[:limit]
+                items.append(item)
             self._json(
                 200,
                 {
                     "items": items,
                     "recording_types": self.server.db.recording_subtypes(),
+                    "has_more": has_more,
+                    "next_offset": offset + len(items) if has_more else None,
                 },
             )
             return
         self._json(404, {"error": "Not found."})
-
-    @staticmethod
-    def _archive_item_sort_key(item: dict[str, Any]) -> tuple[int, str]:
-        try:
-            timestamp = int(item.get("source_timestamp") or 0)
-        except (TypeError, ValueError, OverflowError):
-            timestamp = 0
-        if 0 < timestamp < 10_000_000_000:
-            timestamp *= 1000
-        if timestamp <= 0:
-            raw = str(item.get("created_at") or item.get("deleted_at") or "")
-            try:
-                parsed = datetime.fromisoformat(raw)
-                if parsed.tzinfo is None:
-                    parsed = parsed.replace(tzinfo=timezone.utc)
-                timestamp = int(parsed.timestamp() * 1000)
-            except (OSError, OverflowError, ValueError):
-                timestamp = 0
-        return timestamp, str(item.get("filename") or "")
 
     @staticmethod
     def _deleted_recording_placeholder(item: dict[str, Any]) -> dict[str, Any]:
@@ -720,12 +710,14 @@ class Handler(BaseHTTPRequestHandler):
         if payload is None:
             self._json(400, {"error": "A JSON settings object is required."})
             return
-        current = self.server.db.get_settings()
-        vehicle = payload.get("vehicle")
-        try:
+        settings_payload = payload
+
+        def save_settings() -> dict[str, Any]:
+            current = self.server.db.get_settings()
+            vehicle = settings_payload.get("vehicle")
             if isinstance(vehicle, dict):
                 _apply_vehicle_token_policy(vehicle, current["vehicle"])
-            normalized = validate_settings(payload, current)
+            normalized = validate_settings(settings_payload, current)
             storage_limit = normalized["retention"]["storage_limit"]
             capacity = self._storage_runtime()["storage_capacity_bytes"]
             if (
@@ -736,11 +728,17 @@ class Handler(BaseHTTPRequestHandler):
                 raise SettingsError(
                     "Storage limit cannot exceed the archive filesystem capacity."
                 )
-            saved = self.server.db.save_settings(payload)
+            return self.server.db.save_settings(settings_payload)
+
+        try:
+            saved, retention_result = (
+                self.server.engine.update_settings_and_apply_retention(
+                    save_settings
+                )
+            )
         except SettingsError as exc:
             self._json(400, {"error": str(exc)})
             return
-        retention_result = self.server.engine.apply_retention(saved)
         self._json(
             200,
             {
@@ -1028,10 +1026,13 @@ def main() -> None:
     _prepare_runtime_directories(data_dir, archive_root)
 
     try:
+        # Validate environment-derived defaults even when an existing database
+        # already contains settings and would not need to seed a new row.
+        default_settings()
         db = Database(data_dir / "archive.sqlite3")
         session_secret = _secret(data_dir)
         auth = AuthManager(db, session_secret)
-    except (AuthError, RuntimeError) as exc:
+    except (AuthError, RuntimeError, SettingsError) as exc:
         raise SystemExit(str(exc)) from exc
     engine = SyncEngine(db, archive_root)
     engine.start_scheduler()

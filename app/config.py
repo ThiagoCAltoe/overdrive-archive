@@ -44,6 +44,17 @@ def default_settings() -> dict[str, Any]:
     except ZoneInfoNotFoundError:
         timezone_name = "UTC"
 
+    raw_subdirectory = (
+        os.environ.get("ARCHIVE_DEFAULT_SUBDIRECTORY", "vehicles").strip()
+        or "vehicles"
+    )
+    try:
+        default_subdirectory = normalize_subdirectory(raw_subdirectory)
+    except SettingsError as exc:
+        raise SettingsError(
+            f"ARCHIVE_DEFAULT_SUBDIRECTORY is invalid: {exc}"
+        ) from exc
+
     return {
         "interface": {
             "language": "en",
@@ -93,10 +104,7 @@ def default_settings() -> dict[str, Any]:
         },
         "destination": {
             "type": "local",
-            "subdirectory": (
-                os.environ.get("ARCHIVE_DEFAULT_SUBDIRECTORY", "vehicles").strip()
-                or "vehicles"
-            ),
+            "subdirectory": default_subdirectory,
         },
         "retention": {
             "categories": {

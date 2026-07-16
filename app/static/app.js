@@ -88,6 +88,7 @@ const PT_BR_TEXT = {
   'Private previews from your archive': 'Miniaturas privadas do seu arquivo',
   'Stored media and metadata-only placeholders': 'Mídia armazenada e marcadores somente com metadados',
   'No archived items match these filters.': 'Nenhum item arquivado corresponde a estes filtros.',
+  'Load more': 'Carregar mais',
   'SYNC POLICY': 'POLÍTICA DE SINCRONIZAÇÃO',
   'Every policy is configurable. Nothing here changes the current Overdrive configuration in your vehicle.': 'Todas as políticas são configuráveis. Nada aqui altera a configuração atual do Overdrive no veículo.',
   'Save & test connection': 'Salvar e testar conexão',
@@ -110,6 +111,13 @@ const PT_BR_TEXT = {
   'Left-hand drive': 'Volante à esquerda',
   'Right-hand drive': 'Volante à direita',
   'Vehicle color': 'Cor do veículo',
+  'Recording camera layout': 'Layout das câmeras de gravação',
+  'Surveillance camera layout': 'Layout das câmeras de vigilância',
+  'Automatic / standard': 'Automático / padrão',
+  'Standard 2 × 2': 'Padrão 2 × 2',
+  'Dashcam mosaic': 'Mosaico dashcam',
+  'Used for ACC and Replay recordings when the clip does not report its layout.': 'Usado para gravações ACC e Replay quando o vídeo não informa o próprio layout.',
+  'Used for Surveillance and Proximity recordings when the clip does not report its layout.': 'Usado para gravações de Vigilância e Proximidade quando o vídeo não informa o próprio layout.',
   'Detected device ID': 'ID do dispositivo detectado',
   'Detected Overdrive version': 'Versão detectada do Overdrive',
   'Verify TLS certificates': 'Verificar certificados TLS',
@@ -328,6 +336,10 @@ const state = {
   language: ['en', 'pt-BR'].includes(savedLanguage()) ? savedLanguage() : 'en',
   lastOverview: null,
   lastLibraryItems: null,
+  libraryRequestId: 0,
+  libraryAbortController: null,
+  libraryNextOffset: 0,
+  libraryHasMore: false,
   playerCameraView: 'all',
   playerCameraLayout: 'standard',
 };
@@ -999,6 +1011,12 @@ function populateSettings(settings) {
   $('vehicle-model-id').value = vehicle.model_id || '';
   $('vehicle-drive-side').value = vehicle.drive_side || '';
   $('vehicle-color').value = vehicle.color || '';
+  $('recording-layout').value = ['standard', 'dashcam'].includes(vehicle.recording_layout)
+    ? vehicle.recording_layout
+    : '';
+  $('surveillance-layout').value = ['standard', 'dashcam'].includes(vehicle.surveillance_layout)
+    ? vehicle.surveillance_layout
+    : '';
   $('vehicle-device-id').value = vehicle.device_id || t('Not detected yet');
   $('vehicle-app-version').value = vehicle.app_version || t('Not detected yet');
   const vehicleLabel = vehicle.model_name || vehicle.name || t('Vehicle');
@@ -1077,6 +1095,8 @@ function settingsPayload() {
       model_id: $('vehicle-model-id').value,
       drive_side: $('vehicle-drive-side').value,
       color: $('vehicle-color').value,
+      recording_layout: $('recording-layout').value,
+      surveillance_layout: $('surveillance-layout').value,
       device_id: state.settings?.vehicle?.device_id || '',
       app_version: state.settings?.vehicle?.app_version || '',
       locale: state.settings?.vehicle?.locale || '',
@@ -1170,21 +1190,49 @@ async function testConnection() {
   }
 }
 
-async function loadLibrary() {
+async function loadLibrary({ append = false } = {}) {
   updateRecordingTypeFilterState();
+  const requestId = ++state.libraryRequestId;
+  if (state.libraryAbortController) state.libraryAbortController.abort();
+  const controller = new AbortController();
+  state.libraryAbortController = controller;
+  const loadMore = $('library-load-more');
+  if (!append) {
+    state.libraryNextOffset = 0;
+    state.libraryHasMore = false;
+    loadMore.classList.add('hidden');
+  }
+  loadMore.disabled = true;
   $('library-grid').setAttribute('aria-busy', 'true');
   const params = new URLSearchParams();
   if ($('library-category').value) params.set('category', $('library-category').value);
   if ($('library-recording-type').value) params.set('subtype', $('library-recording-type').value);
   if ($('library-search').value.trim()) params.set('q', $('library-search').value.trim());
-  params.set('limit', '200');
+  params.set('limit', '100');
+  params.set('offset', String(append ? state.libraryNextOffset : 0));
   try {
-    const data = await api(`/api/items?${params}`);
+    const data = await api(`/api/items?${params}`, { signal: controller.signal });
+    if (requestId !== state.libraryRequestId) return;
     renderRecordingTypeFilter(data.recording_types || []);
-    renderLibrary(data.items || []);
+    const pageItems = Array.isArray(data.items) ? data.items : [];
+    const items = append
+      ? [...(state.lastLibraryItems || []), ...pageItems]
+      : pageItems;
+    state.libraryHasMore = Boolean(data.has_more);
+    const nextOffset = Number(data.next_offset);
+    state.libraryNextOffset = data.next_offset !== null && Number.isInteger(nextOffset) && nextOffset >= 0
+      ? nextOffset
+      : items.length;
+    renderLibrary(items);
+    loadMore.classList.toggle('hidden', !state.libraryHasMore);
   } catch (error) {
-    $('library-grid').setAttribute('aria-busy', 'false');
+    if (error.name === 'AbortError') return;
     toast(error.message);
+  } finally {
+    if (requestId !== state.libraryRequestId) return;
+    state.libraryAbortController = null;
+    $('library-grid').setAttribute('aria-busy', 'false');
+    loadMore.disabled = false;
   }
 }
 
@@ -1704,12 +1752,13 @@ $('menu-button').addEventListener('click', () => document.body.classList.toggle(
 $('sync-now-top').addEventListener('click', runSync);
 $('sync-now-hero').addEventListener('click', runSync);
 $('refresh-overview').addEventListener('click', loadOverview);
-$('refresh-library').addEventListener('click', loadLibrary);
+$('refresh-library').addEventListener('click', () => loadLibrary());
+$('library-load-more').addEventListener('click', () => loadLibrary({ append: true }));
 $('library-category').addEventListener('change', () => {
   updateRecordingTypeFilterState();
   loadLibrary();
 });
-$('library-recording-type').addEventListener('change', loadLibrary);
+$('library-recording-type').addEventListener('change', () => loadLibrary());
 let searchTimer;
 $('library-search').addEventListener('input', () => {
   clearTimeout(searchTimer);

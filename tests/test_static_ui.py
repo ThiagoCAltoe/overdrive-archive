@@ -38,6 +38,27 @@ class StaticInterfaceTests(unittest.TestCase):
         self.assertIn("const PT_BR_TEXT", self.javascript)
         self.assertIn("'Deleted locally': 'Apagado localmente'", self.javascript)
 
+    def test_camera_layouts_are_user_configurable(self) -> None:
+        self.assertIn('id="recording-layout"', self.html)
+        self.assertIn('id="surveillance-layout"', self.html)
+        self.assertIn(
+            "recording_layout: $('recording-layout').value",
+            self.javascript,
+        )
+        self.assertIn(
+            "surveillance_layout: $('surveillance-layout').value",
+            self.javascript,
+        )
+
+    def test_library_has_incremental_pagination_and_stale_request_cancellation(
+        self,
+    ) -> None:
+        self.assertIn('id="library-load-more"', self.html)
+        self.assertIn("new AbortController()", self.javascript)
+        self.assertIn("params.set('offset'", self.javascript)
+        self.assertIn("loadLibrary({ append: true })", self.javascript)
+        self.assertNotIn("params.set('limit', '200')", self.javascript)
+
 
 if __name__ == "__main__":
     unittest.main()
