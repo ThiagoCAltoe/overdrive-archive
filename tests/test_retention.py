@@ -215,6 +215,91 @@ class RetentionTests(unittest.TestCase):
         self.assertTrue(self.db.is_retention_tombstoned(item["source_key"]))
         self.assertEqual(self.db.list_retention_deletion_jobs(), [])
 
+    def test_retention_preserves_path_referenced_by_legacy_duplicate_row(
+        self,
+    ) -> None:
+        item = self._add_item("legacy-shared.mp4", age_days=180, sidecars=True)
+        primary = self.engine.archive_root / item["relative_path"]
+        other_source = "source:recordings:legacy-shared-alias"
+        self.assertTrue(
+            self.db.add_item(
+                source_key=other_source,
+                category="recordings",
+                subtype="drive",
+                vehicle="car",
+                filename=item["filename"],
+                relative_path=item["relative_path"],
+                media_type="video/mp4",
+                size_bytes=item["size_bytes"],
+                sha256=item["sha256"],
+                source_timestamp=item["source_timestamp"],
+                metadata={},
+            )
+        )
+        with self.db.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO archive_retention_protections(
+                    source_key,category,protected_at
+                ) VALUES(?,?,?)
+                """,
+                (other_source, "recordings", datetime.now(timezone.utc).isoformat()),
+            )
+
+        result = self.engine.apply_retention(
+            self._save_recording_policy(age_days=1)
+        )
+
+        self.assertEqual(result["deleted_items"], 1)
+        self.assertEqual(result["deleted_bytes"], 0)
+        self.assertTrue(primary.exists())
+        self.assertTrue(primary.with_suffix(".jpg").exists())
+        self.assertTrue(primary.with_suffix(".metadata.json").exists())
+        self.assertTrue(self.db.is_retention_tombstoned(item["source_key"]))
+        self.assertIsNotNone(self.db.get_item_by_source_key(other_source))
+
+    def test_recovery_restores_staged_path_needed_by_legacy_duplicate_row(
+        self,
+    ) -> None:
+        item = self._add_item("crash-shared.mp4", age_days=180, sidecars=True)
+        item_id = int(item["id"])
+        primary = self.engine.archive_root / item["relative_path"]
+        other_source = "source:recordings:crash-shared-alias"
+        self.assertTrue(
+            self.db.add_item(
+                source_key=other_source,
+                category="recordings",
+                subtype="drive",
+                vehicle="car",
+                filename=item["filename"],
+                relative_path=item["relative_path"],
+                media_type="video/mp4",
+                size_bytes=item["size_bytes"],
+                sha256=item["sha256"],
+                source_timestamp=item["source_timestamp"],
+                metadata={},
+            )
+        )
+        staged = primary.with_name(
+            f".retention-{item_id}-{'c' * 24}.pending"
+        )
+        self.assertIsNotNone(
+            self.db.prepare_retention_deletion(
+                item_id,
+                str(staged.relative_to(self.engine.archive_root)),
+            )
+        )
+        primary.replace(staged)
+        self.assertTrue(self.db.delete_archive_item(item_id))
+
+        SyncEngine(self.db, self.engine.archive_root)
+
+        self.assertTrue(primary.exists())
+        self.assertFalse(staged.exists())
+        self.assertTrue(primary.with_suffix(".jpg").exists())
+        self.assertIsNotNone(self.db.get_item_by_source_key(other_source))
+        self.assertEqual(self.db.list_retention_deletion_jobs(), [])
+
     def test_graceful_stop_waits_for_active_retention_boundary(self) -> None:
         self.engine._retention_lock.acquire()
         entered = threading.Event()
@@ -298,6 +383,49 @@ class RetentionTests(unittest.TestCase):
         self.assertFalse(result["limit_satisfied"])
         self.assertTrue((self.engine.archive_root / only["relative_path"]).exists())
         self.assertIsNotNone(self.db.get_item_by_source_key(only["source_key"]))
+
+    def test_pinned_latest_item_occupies_a_keep_latest_slot(self) -> None:
+        oldest = self._add_item("oldest.mp4", age_days=30)
+        middle = self._add_item("middle.mp4", age_days=20)
+        pinned_latest = self._add_item("pinned-latest.mp4", age_days=10)
+        with self.db.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO archive_retention_protections(
+                    source_key,category,protected_at
+                ) VALUES(?,?,?)
+                """,
+                (
+                    pinned_latest["source_key"],
+                    "recordings",
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+        settings = self._save_recording_policy(age_days=1, keep_latest=1)
+
+        result = self.engine.apply_retention(settings)
+
+        self.assertEqual(result["deleted_items"], 2)
+        self.assertTrue(self.db.is_retention_tombstoned(oldest["source_key"]))
+        self.assertTrue(self.db.is_retention_tombstoned(middle["source_key"]))
+        self.assertFalse(
+            self.db.is_retention_tombstoned(pinned_latest["source_key"])
+        )
+        self.assertTrue(self.db.is_retention_protected(pinned_latest["source_key"]))
+        self.assertTrue(
+            (self.engine.archive_root / pinned_latest["relative_path"]).exists()
+        )
+
+    def test_very_large_age_window_saturates_without_datetime_underflow(self) -> None:
+        item = self._add_item("within-huge-window.mp4", age_days=180)
+        settings = self._save_recording_policy(age_days=1_000_000)
+
+        result = self.engine.apply_retention(settings)
+
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["deleted_items"], 0)
+        self.assertFalse(self.db.is_retention_tombstoned(item["source_key"]))
+        self.assertTrue((self.engine.archive_root / item["relative_path"]).exists())
 
     def test_retained_recording_is_not_downloaded_again_from_the_vehicle(self) -> None:
         settings = self.db.save_settings(

@@ -94,6 +94,25 @@ class QueueRecordingClient:
         return filename
 
 
+class PayloadRecordingClient:
+    def __init__(self, item, payload: bytes):
+        self.item = dict(item)
+        self.payload = payload
+        self.downloads = 0
+
+    def iter_recordings(self, recording_types, severities):
+        yield dict(self.item)
+
+    def download_to(self, path, destination, **kwargs):
+        self.downloads += 1
+        destination.write_bytes(self.payload)
+        return len(self.payload), hashlib.sha256(self.payload).hexdigest()
+
+    @staticmethod
+    def encoded_filename(filename):
+        return filename
+
+
 class SyncEngineTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -471,6 +490,113 @@ class SyncEngineTests(unittest.TestCase):
         self.assertFalse(effective_partial.exists())
         self.assertEqual(self.db.list_recording_download_jobs(identity), [])
 
+    def test_vanished_job_preserves_partial_owned_by_effective_live_job(
+        self,
+    ) -> None:
+        settings = self._recording_settings()
+        identity = self.engine._vehicle_identity(settings)
+        filename = "cam_effective_partial.mp4"
+        vanished = {
+            "filename": filename,
+            "type": "normal",
+            "timestamp": RECORDING_TIMESTAMP,
+            "size": 32,
+        }
+        live = {
+            **vanished,
+            "timestamp": RECORDING_TIMESTAMP + 1_000,
+        }
+        vanished_key = (
+            f"{identity}:recording:{filename}:{RECORDING_TIMESTAMP}"
+        )
+        live_key = (
+            f"{identity}:recording:{filename}:{RECORDING_TIMESTAMP + 1_000}"
+        )
+        shared_partial = (
+            self.engine.archive_root
+            / settings["destination"]["subdirectory"]
+            / self.engine._vehicle_slug(settings)
+            / "recordings"
+            / "drive"
+            / "legacy"
+            / f"{filename}.part"
+        )
+        shared_relative = str(
+            shared_partial.relative_to(self.engine.archive_root)
+        )
+        self.db.remember_recording_download_jobs(
+            identity,
+            {vanished_key: vanished, live_key: live},
+            {vanished_key: shared_relative, live_key: shared_relative},
+        )
+        shared_partial.parent.mkdir(parents=True, exist_ok=True)
+        shared_partial.write_bytes(b"live resumable prefix")
+
+        class InterruptedLiveClient(QueueRecordingClient):
+            def download_to(self, path, destination, **kwargs):
+                self.asserted_partial_exists = destination.exists()
+                raise OverdriveError("interrupted for ownership test")
+
+        client = InterruptedLiveClient([live])
+        with self.assertRaisesRegex(OverdriveError, "remain queued"):
+            self.engine._collect_recordings(client, settings, RunTotals())
+
+        self.assertTrue(client.asserted_partial_exists)
+        self.assertEqual(shared_partial.read_bytes(), b"live resumable prefix")
+        self.assertEqual(
+            [
+                job["source_key"]
+                for job in self.db.list_recording_download_jobs(identity)
+            ],
+            [live_key],
+        )
+
+    def test_missing_restore_cleans_partial_after_tombstone_reconciliation(
+        self,
+    ) -> None:
+        settings = self._recording_settings()
+        initial_client = FakeRecordingClient()
+        self.engine._collect_recordings(initial_client, settings, RunTotals())
+        listed = self.db.list_items(category="recordings")[0]
+        archived = self.db.get_item(int(listed["id"]))
+        self.assertIsNotNone(archived)
+        source_key = str(archived["source_key"])
+        final_path = self.engine.archive_root / archived["relative_path"]
+        final_path.unlink()
+        self.assertTrue(self.db.delete_archive_item(int(archived["id"])))
+        self.assertTrue(self.db.request_recording_restore(source_key))
+
+        remote_item = {
+            "filename": archived["filename"],
+            "type": "normal",
+            "timestamp": RECORDING_TIMESTAMP,
+            "size": 32 * 1024 * 1024,
+        }
+        partial_path = final_path.with_suffix(final_path.suffix + ".part")
+        identity = self.engine._vehicle_identity(settings)
+        self.db.remember_recording_download_jobs(
+            identity,
+            {source_key: remote_item},
+            {
+                source_key: str(
+                    partial_path.relative_to(self.engine.archive_root)
+                )
+            },
+        )
+        partial_path.write_bytes(b"interrupted restore")
+        metadata_path = partial_path.with_name(partial_path.name + ".meta")
+        metadata_path.write_text('{"version":1}', encoding="utf-8")
+
+        self.engine._collect_recordings(
+            QueueRecordingClient([]), settings, RunTotals()
+        )
+
+        self.assertFalse(self.db.is_retention_tombstoned(source_key))
+        self.assertFalse(self.db.recording_restore_requested(source_key))
+        self.assertEqual(self.db.list_recording_download_jobs(identity), [])
+        self.assertFalse(partial_path.exists())
+        self.assertFalse(metadata_path.exists())
+
     def test_failed_listing_never_reconciles_deleted_placeholders(self) -> None:
         settings = self._recording_settings()
         client = FakeRecordingClient()
@@ -743,6 +869,142 @@ class SyncEngineTests(unittest.TestCase):
 
         self.assertEqual(client.downloads, 1)
         self.assertEqual(len(self.db.list_items(category="recordings")), 1)
+
+    def test_corrected_timestamp_same_day_gets_an_independent_archive_path(
+        self,
+    ) -> None:
+        settings = self._recording_settings()
+        filename = "cam_corrected_timestamp.mp4"
+        first_payload = b"first-version"
+        second_payload = b"second-value!"
+        first_item = {
+            "filename": filename,
+            "type": "normal",
+            "timestamp": RECORDING_TIMESTAMP,
+            "size": len(first_payload),
+        }
+        second_item = {
+            **first_item,
+            "timestamp": RECORDING_TIMESTAMP + 1_000,
+            "size": len(second_payload),
+        }
+        first_client = PayloadRecordingClient(first_item, first_payload)
+        second_client = PayloadRecordingClient(second_item, second_payload)
+
+        self.engine._collect_recordings(first_client, settings, RunTotals())
+        self.engine._collect_recordings(second_client, settings, RunTotals())
+
+        archived = self.db.list_items(category="recordings")
+        self.assertEqual(first_client.downloads, 1)
+        self.assertEqual(second_client.downloads, 1)
+        self.assertEqual(len(archived), 2)
+        self.assertEqual(len({item["relative_path"] for item in archived}), 2)
+        payloads = {
+            int(item["source_timestamp"]): (
+                self.engine.archive_root / item["relative_path"]
+            ).read_bytes()
+            for item in archived
+        }
+        self.assertEqual(payloads[RECORDING_TIMESTAMP], first_payload)
+        self.assertEqual(payloads[RECORDING_TIMESTAMP + 1_000], second_payload)
+
+    def test_different_vehicle_identity_with_same_slug_cannot_share_a_path(
+        self,
+    ) -> None:
+        first_settings = self._recording_settings("Family car")
+        item = {
+            "filename": "cam_same_slug.mp4",
+            "type": "normal",
+            "timestamp": RECORDING_TIMESTAMP,
+            "size": 9,
+        }
+        first_payload = b"vehicle-a"
+        second_payload = b"vehicle-b"
+        first_client = PayloadRecordingClient(item, first_payload)
+        second_client = PayloadRecordingClient(item, second_payload)
+
+        self.engine._collect_recordings(first_client, first_settings, RunTotals())
+        second_settings = self.db.save_settings(
+            {
+                "vehicle": {
+                    "name": "Family car",
+                    "device_id": "other-stable-device",
+                    "device_token": "other-stable-device-12345678",
+                }
+            }
+        )
+        self.engine._collect_recordings(second_client, second_settings, RunTotals())
+
+        archived = self.db.list_items(category="recordings")
+        self.assertEqual(first_client.downloads, 1)
+        self.assertEqual(second_client.downloads, 1)
+        self.assertEqual(len(archived), 2)
+        self.assertEqual(len({item["relative_path"] for item in archived}), 2)
+        self.assertEqual(
+            {
+                (self.engine.archive_root / item["relative_path"]).read_bytes()
+                for item in archived
+            },
+            {first_payload, second_payload},
+        )
+
+    def test_sync_lazily_separates_a_legacy_shared_inventory_path(self) -> None:
+        settings = self._recording_settings()
+        identity = self.engine._vehicle_identity(settings)
+        filename = "cam_legacy_shared.mp4"
+        source_key = f"{identity}:recording:{filename}:{RECORDING_TIMESTAMP}"
+        alias_key = (
+            f"vehicle-legacy-alias:recording:{filename}:{RECORDING_TIMESTAMP}"
+        )
+        legacy_relative = (
+            Path(settings["destination"]["subdirectory"])
+            / self.engine._vehicle_slug(settings)
+            / "recordings"
+            / "drive"
+            / filename
+        )
+        legacy_path = self.engine.archive_root / legacy_relative
+        legacy_path.parent.mkdir(parents=True, exist_ok=True)
+        legacy_payload = b"shared-old"
+        legacy_path.write_bytes(legacy_payload)
+        for key in (source_key, alias_key):
+            self.assertTrue(
+                self.db.add_item(
+                    source_key=key,
+                    category="recordings",
+                    subtype="drive",
+                    vehicle=self.engine._vehicle_slug(settings),
+                    filename=filename,
+                    relative_path=str(legacy_relative),
+                    media_type="video/mp4",
+                    size_bytes=len(legacy_payload),
+                    sha256=hashlib.sha256(legacy_payload).hexdigest(),
+                    source_timestamp=RECORDING_TIMESTAMP,
+                    metadata={},
+                )
+            )
+        current_payload = b"current-new-payload"
+        item = {
+            "filename": filename,
+            "type": "normal",
+            "timestamp": RECORDING_TIMESTAMP,
+            "size": len(current_payload),
+        }
+        client = PayloadRecordingClient(item, current_payload)
+
+        self.engine._collect_recordings(client, settings, RunTotals())
+
+        current = self.db.get_item_by_source_key(source_key)
+        alias = self.db.get_item_by_source_key(alias_key)
+        self.assertEqual(client.downloads, 1)
+        self.assertIsNotNone(current)
+        self.assertIsNotNone(alias)
+        self.assertNotEqual(current["relative_path"], alias["relative_path"])
+        self.assertEqual(legacy_path.read_bytes(), legacy_payload)
+        self.assertEqual(
+            (self.engine.archive_root / current["relative_path"]).read_bytes(),
+            current_payload,
+        )
 
     def test_status_device_identity_is_used_when_profile_import_is_disabled(self) -> None:
         settings = self._recording_settings("Car A")

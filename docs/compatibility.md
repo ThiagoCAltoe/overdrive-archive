@@ -71,7 +71,13 @@ the item as `normal`. Archived files are organized separately:
 
 ```text
 <archive>/<destination>/<vehicle>/recordings/replay/YYYY/MM/DD/
+└── <vehicle-identity>-<timestamp-ms>/
+    └── replay_YYYYMMDD_HHMMSS[_N].mp4
 ```
+
+The source-owned directory prevents two recording identities from sharing one
+physical file when a timestamp is corrected or two vehicles use the same
+display name.
 
 The compatibility logic is covered by local tests. Full device validation
 against every Overdrive release and storage backend is still recommended while

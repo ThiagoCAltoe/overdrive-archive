@@ -688,7 +688,10 @@ class SyncEngine:
                     "error_count": recovery_errors,
                 }
 
-            candidates = self.db.list_retention_candidates()
+            # Keep-latest is a rank across the complete local category. A
+            # manually pinned item can occupy one of those newest slots while
+            # remaining independently protected from every deletion policy.
+            candidates = self.db.list_retention_candidates(include_protected=True)
             manually_protected = self.db.list_retention_protected_source_keys()
             protected_ids: set[int] = {
                 int(item["id"])
@@ -727,7 +730,14 @@ class SyncEngine:
                     "hours": 3600,
                     "days": 86400,
                 }[rule["unit"]]
-                if self._retention_item_datetime(item) >= now - timedelta(seconds=seconds):
+                try:
+                    cutoff = now - timedelta(seconds=seconds)
+                except OverflowError:
+                    # A valid, very large policy can reach farther back than
+                    # datetime.min. Saturating means every representable item
+                    # is correctly considered inside the retention window.
+                    cutoff = datetime.min.replace(tzinfo=timezone.utc)
+                if self._retention_item_datetime(item) >= cutoff:
                     continue
                 deleted, freed, cleanup_error = self._delete_local_archive_item(item)
                 if deleted:
@@ -934,6 +944,60 @@ class SyncEngine:
                 errors += 1
                 continue
 
+            try:
+                shared_path = (
+                    self.db.count_archive_path_references(
+                        str(job.get("original_relative_path") or "")
+                    )
+                    > 0
+                )
+            except Exception:
+                log.exception(
+                    "Retention could not verify path ownership for item %s",
+                    item_id,
+                )
+                errors += 1
+                continue
+            if shared_path:
+                try:
+                    original_info = self._path_lstat(original)
+                    staged_info = self._path_lstat(staged)
+                except OSError:
+                    log.exception(
+                        "Retention could not inspect shared staged item %s",
+                        item_id,
+                    )
+                    errors += 1
+                    continue
+                if staged_info is not None:
+                    if stat.S_ISDIR(staged_info.st_mode) or original_info is not None:
+                        log.error(
+                            "Retention preserved conflicting shared files for item %s",
+                            item_id,
+                        )
+                        errors += 1
+                        continue
+                    try:
+                        staged.replace(original)
+                    except OSError:
+                        log.exception(
+                            "Retention could not restore shared item %s", item_id
+                        )
+                        errors += 1
+                        continue
+                try:
+                    finished = self.db.finish_retention_deletion(item_id)
+                except Exception:
+                    log.exception(
+                        "Retention could not finish shared cleanup journal for item %s",
+                        item_id,
+                    )
+                    errors += 1
+                    continue
+                if not finished:
+                    errors += 1
+                continue
+
             cleanup_paths = [staged, original]
             cleanup_paths.extend(
                 self._retention_sidecar_paths(
@@ -969,6 +1033,29 @@ class SyncEngine:
             log.error("Retention refused an unsafe archive item path for item %s", item.get("id"))
             return False, 0, True
         item_id = int(item["id"])
+        try:
+            shared_path = (
+                self.db.count_archive_path_references(
+                    str(item.get("relative_path") or "")
+                )
+                > 1
+            )
+        except Exception:
+            log.exception(
+                "Retention could not verify path ownership for item %s", item_id
+            )
+            return False, 0, True
+        if shared_path:
+            try:
+                transitioned = self.db.delete_archive_item(item_id)
+            except Exception:
+                log.exception(
+                    "Retention database transition failed for shared item %s",
+                    item_id,
+                )
+                return False, 0, True
+            return transitioned, 0, not transitioned
+
         staged_primary: Path | None = None
         for _ in range(20):
             candidate = primary.with_name(
@@ -1173,9 +1260,10 @@ class SyncEngine:
         settings: dict[str, Any],
         item: dict[str, Any],
         *,
+        identity: str,
         vehicle: str,
     ) -> tuple[str, str, int, Path, Path]:
-        """Return the validated deterministic destination for one recording."""
+        """Return a deterministic destination owned by one source identity."""
         filename = self._safe_filename(item.get("filename"))
         subtype = recording_subtype(item, filename)
         try:
@@ -1198,6 +1286,7 @@ class SyncEngine:
             / f"{date:%Y}"
             / f"{date:%m}"
             / f"{date:%d}"
+            / f"{identity}-{timestamp_ms}"
             / filename
         )
         return (
@@ -1257,8 +1346,15 @@ class SyncEngine:
         partial_relative_path: str = "",
     ) -> RecordingQueueEntry:
         filename, subtype, timestamp_ms, relative, final_path = (
-            self._recording_archive_path(settings, item, vehicle=vehicle)
+            self._recording_archive_path(
+                settings,
+                item,
+                identity=identity,
+                vehicle=vehicle,
+            )
         )
+        canonical_relative = relative
+        canonical_final_path = final_path
         try:
             expected_size = max(0, int(item.get("size") or 0))
         except (TypeError, ValueError) as exc:
@@ -1281,6 +1377,35 @@ class SyncEngine:
                 relative = existing_relative
             except (KeyError, OSError, TypeError, ValueError):
                 final_path = self._safe_archive_path(relative)
+        try:
+            if self.db.archive_path_has_other_source(str(relative), source_key):
+                # Older builds could assign this path to multiple source keys.
+                # Move the current identity to its new canonical destination
+                # before any write so the legacy owner's bytes remain intact.
+                relative = canonical_relative
+                final_path = canonical_final_path
+                if self.db.archive_path_has_other_source(
+                    str(relative), source_key
+                ):
+                    source_digest = hashlib.sha256(
+                        source_key.encode("utf-8")
+                    ).hexdigest()
+                    relative = (
+                        canonical_relative.parent
+                        / f"source-{source_digest}"
+                        / filename
+                    )
+                    final_path = self._safe_archive_path(relative)
+                    if self.db.archive_path_has_other_source(
+                        str(relative), source_key
+                    ):
+                        raise OverdriveError(
+                            "Recording archive path belongs to another source."
+                        )
+        except (OSError, TypeError, ValueError) as exc:
+            raise OverdriveError(
+                "Could not verify recording archive path ownership."
+            ) from exc
         partial_path = final_path.with_suffix(final_path.suffix + ".part")
         try:
             effective_partial_relative = str(
@@ -1370,7 +1495,12 @@ class SyncEngine:
             source_key = f"{identity}:recording:{filename}:{timestamp_ms}"
             all_live_jobs[source_key] = dict(item)
             _name, _subtype, _timestamp, _relative, final_path = (
-                self._recording_archive_path(settings, item, vehicle=vehicle)
+                self._recording_archive_path(
+                    settings,
+                    item,
+                    identity=identity,
+                    vehicle=vehicle,
+                )
             )
             partial_path = final_path.with_suffix(final_path.suffix + ".part")
             all_live_partial_paths[source_key] = str(
@@ -1404,9 +1534,15 @@ class SyncEngine:
             },
         )
         new_keys = set(live_jobs) - known_live_keys
-        current_partial_paths = set(all_live_partial_paths.values())
+        persisted_jobs = self.db.list_recording_download_jobs(identity)
+        current_partial_paths = {
+            str(stored.get("partial_relative_path") or "")
+            for stored in persisted_jobs
+            if str(stored["source_key"]) in all_live_jobs
+            and str(stored.get("partial_relative_path") or "")
+        }
         stored_rows: list[dict[str, Any]] = []
-        for stored in self.db.list_recording_download_jobs(identity):
+        for stored in persisted_jobs:
             self._check_cancelled()
             source_key = str(stored["source_key"])
             if source_key not in all_live_jobs:
@@ -1414,7 +1550,10 @@ class SyncEngine:
                 if not stored_partial:
                     _name, _subtype, _timestamp, _relative, final_path = (
                         self._recording_archive_path(
-                            settings, stored["item"], vehicle=vehicle
+                            settings,
+                            stored["item"],
+                            identity=identity,
+                            vehicle=vehicle,
                         )
                     )
                     stored_partial = str(
@@ -1422,8 +1561,8 @@ class SyncEngine:
                             self.archive_root.resolve()
                         )
                     )
-                # A corrected timestamp can create a new source key that owns
-                # the exact same deterministic partial path.
+                # Never remove artifacts that an effective, persisted live job
+                # owns, including paths retained from an older app version.
                 if (
                     stored_partial not in current_partial_paths
                     and not self._discard_vanished_recording_partial(stored_partial)

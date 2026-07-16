@@ -510,6 +510,11 @@ invented percentage. A stopped run keeps a validated `.part` for the next run
 and never starts a second synchronization behind the first one.
 
 Recording identity uses the vehicle identity, filename, and source timestamp.
+A source-owned directory containing the stable vehicle identity and exact
+millisecond timestamp keeps the physical path unique even when Overdrive
+corrects a timestamp or two configured vehicles share the same display name.
+Inventory paths created by an older release remain readable and are separated
+lazily if a later synchronization detects that two identities share one path.
 A missing local file or an expected-size mismatch is downloaded again. If a
 vehicle silently replaces a recording while keeping the same filename,
 timestamp, and byte size and exposes no checksum, that change cannot be
@@ -525,9 +530,10 @@ archive/
         ├── recordings/
         │   ├── drive/2026/07/16/
         │   ├── replay/2026/07/16/
-        │   │   ├── replay_20260716_143012.mp4
-        │   │   ├── replay_20260716_143012.metadata.json
-        │   │   └── replay_20260716_143012.jpg
+        │   │   └── vehicle-a1b2c3d4e5f60718293a4b5c-1784208612000/
+        │   │       ├── replay_20260716_143012.mp4
+        │   │       ├── replay_20260716_143012.metadata.json
+        │   │       └── replay_20260716_143012.jpg
         │   ├── surveillance/2026/07/16/
         │   ├── proximity/2026/07/16/
         │   └── oem_dashcam/2026/07/16/

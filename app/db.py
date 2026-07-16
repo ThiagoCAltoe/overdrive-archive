@@ -823,10 +823,11 @@ class Database:
                     """,
                     ((source_key, identity) for source_key in sorted(missing_keys)),
                 )
-                conn.executemany(
-                    "DELETE FROM recording_download_jobs WHERE source_key=?",
-                    ((source_key,) for source_key in sorted(missing_keys)),
-                )
+
+                # A missing tombstone can still have a resumable restore job.
+                # Keep the job until SyncEngine has deterministically removed
+                # its .part and .part.meta artifacts. The engine deletes the
+                # job only after that cleanup succeeds.
 
         return {"updated": len(present_keys), "purged": len(missing_keys)}
 
@@ -1017,6 +1018,45 @@ class Database:
             ).fetchone()
         return dict(row) if row else None
 
+    def count_archive_path_references(self, relative_path: str) -> int:
+        """Count inventory rows that still depend on one physical path."""
+        if (
+            not isinstance(relative_path, str)
+            or not relative_path
+            or len(relative_path) > 4096
+            or any(ord(character) < 32 for character in relative_path)
+        ):
+            raise ValueError("Archive path is invalid.")
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM archive_items WHERE relative_path=?",
+                (relative_path,),
+            ).fetchone()
+        return int(row[0])
+
+    def archive_path_has_other_source(
+        self, relative_path: str, source_key: str
+    ) -> bool:
+        """Return whether another inventory identity owns the same path."""
+        if (
+            not isinstance(relative_path, str)
+            or not relative_path
+            or len(relative_path) > 4096
+            or any(ord(character) < 32 for character in relative_path)
+        ):
+            raise ValueError("Archive path is invalid.")
+        normalized_source = self._recording_job_identity(source_key, "Source key")
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT 1 FROM archive_items
+                 WHERE relative_path=? AND source_key<>?
+                 LIMIT 1
+                """,
+                (relative_path, normalized_source),
+            ).fetchone()
+        return row is not None
+
     def add_item(
         self,
         *,
@@ -1107,13 +1147,17 @@ class Database:
         return dict(row) if row else None
 
     def list_retention_candidates(
-        self, category: str | None = None
+        self,
+        category: str | None = None,
+        *,
+        include_protected: bool = False,
     ) -> list[dict[str, Any]]:
-        """Return unpinned archive rows in stable insertion order.
+        """Return archive rows in stable insertion order.
 
         The engine applies recorded-at time first and falls back to local
         insertion time when the source supplied no usable timestamp. The caller
-        remains responsible for deleting files before removing the row.
+        remains responsible for deleting files before removing the row. Pinned
+        rows are omitted unless ``include_protected`` is requested for ranking.
         """
         normalized_category = ""
         if category is not None:
@@ -1121,14 +1165,16 @@ class Database:
                 raise ValueError("Retention category must be text.")
             normalized_category = category.strip()
 
-        clauses = [
-            "NOT EXISTS ("
-            "SELECT 1 FROM archive_retention_protections AS protection "
-            "WHERE protection.source_key=item.source_key)"
-        ]
+        clauses: list[str] = []
+        if not include_protected:
+            clauses.append(
+                "NOT EXISTS ("
+                "SELECT 1 FROM archive_retention_protections AS protection "
+                "WHERE protection.source_key=item.source_key)"
+            )
         if normalized_category:
             clauses.append("item.category=?")
-        where = "WHERE " + " AND ".join(clauses)
+        where = "WHERE " + " AND ".join(clauses) if clauses else ""
         parameters: tuple[Any, ...] = (
             (normalized_category,) if normalized_category else ()
         )

@@ -384,6 +384,33 @@ class RetentionDatabaseTests(unittest.TestCase):
             [candidate["source_key"] for candidate in candidates], ["video"]
         )
 
+    def test_candidates_can_include_pinned_rows_for_keep_latest_ranking(self) -> None:
+        pinned_id = self.add_item("pinned")
+        self.add_item("ordinary")
+        with self.database.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO archive_retention_protections(
+                    source_key,category,protected_at
+                ) VALUES('pinned','recordings','2026-07-16T00:00:00+00:00')
+                """
+            )
+
+        ordinary_candidates = self.database.list_retention_candidates()
+        ranking_candidates = self.database.list_retention_candidates(
+            include_protected=True
+        )
+
+        self.assertEqual(
+            [candidate["source_key"] for candidate in ordinary_candidates],
+            ["ordinary"],
+        )
+        self.assertEqual(
+            [candidate["source_key"] for candidate in ranking_candidates],
+            ["pinned", "ordinary"],
+        )
+        self.assertEqual(int(ranking_candidates[0]["id"]), pinned_id)
+
     def test_delete_removes_only_inventory_row_and_never_touches_file(self) -> None:
         item_id = self.add_item("delete-row")
         keep_id = self.add_item("keep-row")
@@ -644,8 +671,12 @@ class RestorableRetentionDatabaseTests(unittest.TestCase):
         self.assertTrue(self.database.is_retention_tombstoned(keep))
         self.assertFalse(self.database.is_retention_tombstoned(missing))
         self.assertTrue(self.database.is_retention_tombstoned(other))
+        # Reconciliation removes the placeholder, but SyncEngine owns cleanup
+        # of resumable artifacts before it removes the corresponding job.
+        remaining_jobs = self.database.list_recording_download_jobs("vehicle-one")
         self.assertEqual(
-            self.database.list_recording_download_jobs("vehicle-one"), []
+            [job["source_key"] for job in remaining_jobs],
+            [missing],
         )
         with self.database.connect() as conn:
             row = conn.execute(
