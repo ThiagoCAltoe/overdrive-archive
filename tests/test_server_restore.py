@@ -7,6 +7,7 @@ import unittest
 from http.client import HTTPConnection
 from pathlib import Path
 
+from app.db import RetentionCleanupPending
 from app.server import ArchiveHTTPServer, Handler, SESSION_COOKIE
 
 
@@ -18,6 +19,7 @@ class _Auth:
 class _Database:
     def __init__(self) -> None:
         self.restore_exists = True
+        self.cleanup_pending = False
         self.restore_identity = "vehicle:test"
         self.restore_requests: list[str] = []
         self.deleted_filters: list[dict] = []
@@ -58,6 +60,7 @@ class _Database:
                 "deleted_at": "2026-07-16T18:00:00+00:00",
                 "last_seen_at": "2026-07-16T17:00:00+00:00",
                 "restore_requested_at": "",
+                "cleanup_pending": self.cleanup_pending,
                 "internal_value": "must-not-leak",
             }
         ]
@@ -67,6 +70,8 @@ class _Database:
 
     def request_recording_restore(self, source_key: str) -> str | None:
         self.restore_requests.append(source_key)
+        if self.cleanup_pending:
+            raise RetentionCleanupPending("cleanup pending for test")
         return self.restore_identity if self.restore_exists else None
 
     def get_item(self, item_id: int):
@@ -85,6 +90,7 @@ class _Engine:
     def __init__(self) -> None:
         self.start_sync = True
         self.current_identity = "vehicle:test"
+        self.identity_requires_probe = False
         self.triggers: list[str] = []
         self.retention_calls: list[dict] = []
 
@@ -94,6 +100,12 @@ class _Engine:
 
     def configured_vehicle_identity(self) -> str:
         return self.current_identity
+
+    def can_start_recording_restore(self, restore_identity: str) -> bool:
+        return (
+            restore_identity == self.current_identity
+            or self.identity_requires_probe
+        )
 
     def apply_retention(self, settings: dict) -> dict:
         self.retention_calls.append(settings)
@@ -184,6 +196,7 @@ class RecordingRestoreServerTests(unittest.TestCase):
         self.assertEqual(deleted["remote_size_bytes"], 456)
         self.assertIsNone(deleted["thumbnail_url"])
         self.assertIsNone(deleted["media_url"])
+        self.assertFalse(deleted["cleanup_pending"])
         self.assertNotIn("relative_path", deleted)
         self.assertNotIn("internal_value", deleted)
 
@@ -234,6 +247,22 @@ class RecordingRestoreServerTests(unittest.TestCase):
         self.assertEqual(self.database.restore_requests, ["recording-source"])
         self.assertEqual(self.engine.triggers, [])
 
+    def test_restore_starts_an_identity_probe_when_saved_identity_is_uncertain(
+        self,
+    ) -> None:
+        self.database.restore_identity = "vehicle:observed"
+        self.engine.identity_requires_probe = True
+
+        status, payload = self._request(
+            "POST",
+            "/api/recordings/restore",
+            payload={"source_key": "recording-source"},
+        )
+
+        self.assertEqual(status, 202)
+        self.assertEqual(payload, {"queued": True, "sync_started": True})
+        self.assertEqual(self.engine.triggers, ["restore"])
+
     def test_restore_returns_not_found_without_triggering_sync(self) -> None:
         self.database.restore_exists = False
 
@@ -245,6 +274,21 @@ class RecordingRestoreServerTests(unittest.TestCase):
 
         self.assertEqual(status, 404)
         self.assertEqual(payload, {"error": "Deleted recording not found."})
+        self.assertEqual(self.engine.triggers, [])
+
+    def test_restore_reports_pending_local_cleanup_as_a_conflict(self) -> None:
+        self.database.cleanup_pending = True
+
+        status, payload = self._request(
+            "POST",
+            "/api/recordings/restore",
+            payload={"source_key": "recording-source"},
+        )
+
+        self.assertEqual(status, 409)
+        self.assertEqual(payload["code"], "retention_cleanup_pending")
+        self.assertIn("cleanup is still in progress", payload["error"])
+        self.assertEqual(self.database.restore_requests, ["recording-source"])
         self.assertEqual(self.engine.triggers, [])
 
     def test_restore_requires_authentication(self) -> None:

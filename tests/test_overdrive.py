@@ -402,6 +402,69 @@ class OverdriveClientTests(unittest.TestCase):
         self.assertEqual(len(recordings), 201)
         self.assertEqual(self.client.get_json.call_count, 2)
 
+    def test_recording_listing_adopts_server_page_size_clamp(self) -> None:
+        available = [
+            {"filename": f"cam_{index:03d}.mp4"}
+            for index in range(121)
+        ]
+        requested_page_sizes = []
+
+        def clamped_listing(path, **_kwargs):
+            query = path.partition("?")[2]
+            params = dict(
+                part.split("=", 1)
+                for part in query.split("&")
+            )
+            page = int(params["page"])
+            requested_page_size = int(params["pageSize"])
+            requested_page_sizes.append(requested_page_size)
+            page_size = min(requested_page_size, 50)
+            start = (page - 1) * page_size
+            total_pages = (len(available) + page_size - 1) // page_size
+            return {
+                "recordings": available[start : start + page_size],
+                "totalCount": len(available),
+                "totalPages": total_pages,
+                "page": page,
+                "pageSize": page_size,
+            }
+
+        self.client.get_json = Mock(side_effect=clamped_listing)
+
+        recordings = list(self.client.iter_recordings([], []))
+
+        self.assertEqual(recordings, available)
+        self.assertEqual(requested_page_sizes, [200, 50, 50])
+
+    def test_recording_listing_rejects_page_size_change_after_first_page(self) -> None:
+        self.client.get_json = Mock(
+            side_effect=[
+                {
+                    "recordings": [
+                        {"filename": f"cam_{index:03d}.mp4"}
+                        for index in range(50)
+                    ],
+                    "totalCount": 75,
+                    "totalPages": 2,
+                    "page": 1,
+                    "pageSize": 50,
+                },
+                {
+                    "recordings": [
+                        {"filename": f"cam_{index:03d}.mp4"}
+                        for index in range(50, 75)
+                    ],
+                    "totalCount": 75,
+                    "totalPages": 3,
+                    "page": 2,
+                    "pageSize": 25,
+                },
+            ]
+        )
+
+        with self.assertRaisesRegex(OverdriveError, "inconsistent pagination"):
+            list(self.client.iter_recordings([], []))
+
     def test_recording_listing_rejects_a_count_change_between_pages(self) -> None:
         first_page = [{"filename": f"cam_{index:03d}.mp4"} for index in range(200)]
         second_page = [{"filename": "cam_200.mp4"}, {"filename": "cam_201.mp4"}]

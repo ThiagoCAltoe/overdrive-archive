@@ -267,13 +267,15 @@ class OverdriveClient:
         recording_types: list[str],
         severities: list[str],
     ) -> Iterator[dict[str, Any]]:
-        page_size = 200
+        requested_page_size = 200
+        page_size: int | None = None
         listing_total: int | None = None
         emitted = 0
         for page in range(1, 1001):
+            request_page_size = page_size or requested_page_size
             params: dict[str, Any] = {
                 "page": page,
-                "pageSize": page_size,
+                "pageSize": request_page_size,
             }
             if recording_types:
                 params["type"] = ",".join(recording_types)
@@ -296,6 +298,16 @@ class OverdriveClient:
                 raise OverdriveError(
                     "Recordings API returned invalid pagination metadata."
                 ) from exc
+            if page_size is None:
+                # Older Overdrive releases clamp the requested 200 rows to a
+                # smaller server-side maximum. Adopt the value reported by the
+                # first response and use it for every following request so page
+                # offsets cannot overlap or leave gaps.
+                if not 1 <= response_page_size <= requested_page_size:
+                    raise OverdriveError(
+                        "Recordings API returned inconsistent pagination metadata."
+                    )
+                page_size = response_page_size
             expected_pages = max(1, (total_count + page_size - 1) // page_size)
             if (
                 total_count < 0

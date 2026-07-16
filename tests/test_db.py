@@ -127,6 +127,52 @@ class RecordingDownloadJobTests(unittest.TestCase):
         self.assertEqual(len(jobs), 1)
         self.assertEqual(jobs[0]["partial_relative_path"], "")
 
+    def test_legacy_partial_paths_are_normalized_before_global_lookup(self) -> None:
+        path = Path(self.temporary.name) / "legacy-partial-path.sqlite3"
+        with sqlite3.connect(path) as conn:
+            conn.execute(
+                """
+                CREATE TABLE recording_download_jobs (
+                    source_key TEXT PRIMARY KEY,
+                    vehicle_identity TEXT NOT NULL,
+                    item_json TEXT NOT NULL,
+                    partial_relative_path TEXT NOT NULL DEFAULT '',
+                    first_seen_at TEXT NOT NULL,
+                    last_seen_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO recording_download_jobs(
+                    source_key,vehicle_identity,item_json,
+                    partial_relative_path,first_seen_at,last_seen_at
+                ) VALUES(?,?,?,?,?,?)
+                """,
+                (
+                    "legacy-source",
+                    "vehicle-one",
+                    '{"filename":"legacy.mp4"}',
+                    "vehicles/legacy/./shared.mp4.part/",
+                    "2026-07-16T10:00:00+00:00",
+                    "2026-07-16T10:00:00+00:00",
+                ),
+            )
+
+        migrated = Database(path)
+
+        jobs = migrated.list_recording_download_jobs("vehicle-one")
+        self.assertEqual(
+            jobs[0]["partial_relative_path"],
+            "vehicles/legacy/shared.mp4.part",
+        )
+        self.assertEqual(
+            migrated.recording_download_job_sources_for_partial(
+                "vehicles/legacy/./shared.mp4.part"
+            ),
+            {"legacy-source"},
+        )
+
     def test_batch_remember_is_canonical_and_reports_preexisting_keys(self) -> None:
         with patch("app.db.utc_now", return_value="2026-07-16T13:00:00+00:00"):
             known = self.database.remember_recording_download_jobs(
@@ -249,6 +295,31 @@ class RecordingDownloadJobTests(unittest.TestCase):
         self.assertEqual(jobs[0]["item"], {"filename": "one.mp4"})
         self.assertIn("first_seen_at", jobs[0])
         self.assertIn("last_seen_at", jobs[0])
+
+    def test_partial_references_are_global_across_vehicle_identities(self) -> None:
+        shared = "vehicles/legacy/shared-recording.mp4.part"
+        self.database.remember_recording_download_jobs(
+            "vehicle-one",
+            {"vehicle-one:recording:shared.mp4:1": {"filename": "shared.mp4"}},
+            {
+                "vehicle-one:recording:shared.mp4:1": (
+                    "vehicles/legacy/./shared-recording.mp4.part/"
+                )
+            },
+        )
+        self.database.remember_recording_download_jobs(
+            "vehicle-two",
+            {"vehicle-two:recording:shared.mp4:2": {"filename": "shared.mp4"}},
+            {"vehicle-two:recording:shared.mp4:2": shared},
+        )
+
+        self.assertEqual(
+            self.database.recording_download_job_sources_for_partial(shared),
+            {
+                "vehicle-one:recording:shared.mp4:1",
+                "vehicle-two:recording:shared.mp4:2",
+            },
+        )
 
     def test_bad_item_rejects_the_entire_discovery_batch(self) -> None:
         with self.assertRaisesRegex(ValueError, "valid JSON values"):
@@ -781,6 +852,9 @@ class RestorableRetentionDatabaseTests(unittest.TestCase):
             requested[0]["restore_requested_at"],
             "2026-07-16T17:00:00+00:00",
         )
+        self.assertFalse(self.database.complete_recording_restore(source_key))
+        self.assertTrue(self.database.is_retention_tombstoned(source_key))
+        self.assertFalse(self.database.is_retention_protected(source_key))
 
         restored = self.database.add_item(
             source_key=source_key,
@@ -817,6 +891,173 @@ class RestorableRetentionDatabaseTests(unittest.TestCase):
         self.assertTrue(
             self.database.delete_archive_item(int(restored_row["id"]))
         )
+
+    def test_missing_restored_inventory_stays_finalizable_and_out_of_retention(
+        self,
+    ) -> None:
+        source_key = self.retain_recording(
+            "vehicle-one", "recovered-after-rotation.mp4", 550
+        )
+        self.assertEqual(
+            self.database.request_recording_restore(source_key),
+            "vehicle-one",
+        )
+        self.database.remember_recording_download_jobs(
+            "vehicle-one",
+            {
+                source_key: {
+                    "filename": "recovered-after-rotation.mp4",
+                    "timestamp": 550,
+                    "size": 100,
+                }
+            },
+        )
+        self.assertTrue(
+            self.database.add_item(
+                source_key=source_key,
+                category="recordings",
+                subtype="drive",
+                vehicle="Test vehicle",
+                filename="recovered-after-rotation.mp4",
+                relative_path=(
+                    "vehicles/test/recordings/recovered-after-rotation.mp4"
+                ),
+                media_type="video/mp4",
+                size_bytes=100,
+                sha256="b" * 64,
+                source_timestamp=550,
+                metadata={"restored": True},
+            )
+        )
+
+        reconciliation = self.database.reconcile_recording_tombstones(
+            "vehicle-one", {}
+        )
+
+        self.assertEqual(reconciliation, {"updated": 0, "purged": 0})
+        self.assertTrue(self.database.is_retention_tombstoned(source_key))
+        restored = self.database.get_item_by_source_key(source_key)
+        self.assertIsNotNone(restored)
+        self.assertNotIn(
+            source_key,
+            {
+                row["source_key"]
+                for row in self.database.list_retention_candidates(
+                    include_protected=True
+                )
+            },
+        )
+        self.assertFalse(self.database.delete_archive_item(int(restored["id"])))
+        self.assertIsNone(
+            self.database.prepare_retention_deletion(
+                int(restored["id"]),
+                "vehicles/test/recordings/.retention-recovery.pending",
+            )
+        )
+
+        self.assertTrue(self.database.complete_recording_restore(source_key))
+        self.assertTrue(
+            self.database.complete_recording_download_job(source_key)
+        )
+        self.assertFalse(self.database.is_retention_tombstoned(source_key))
+        self.assertTrue(self.database.is_retention_protected(source_key))
+
+    def test_missing_incomplete_restore_is_purged_when_its_job_finishes(
+        self,
+    ) -> None:
+        source_key = self.retain_recording(
+            "vehicle-one", "incomplete-after-rotation.mp4", 575
+        )
+        self.assertEqual(
+            self.database.request_recording_restore(source_key),
+            "vehicle-one",
+        )
+        self.database.remember_recording_download_jobs(
+            "vehicle-one",
+            {
+                source_key: {
+                    "filename": "incomplete-after-rotation.mp4",
+                    "timestamp": 575,
+                    "size": 100,
+                }
+            },
+        )
+
+        reconciliation = self.database.reconcile_recording_tombstones(
+            "vehicle-one", {}
+        )
+
+        self.assertEqual(reconciliation, {"updated": 0, "purged": 0})
+        self.assertTrue(self.database.is_retention_tombstoned(source_key))
+        with self.database.connect() as conn:
+            last_seen_at = conn.execute(
+                """
+                SELECT last_seen_at FROM archive_retention_tombstones
+                 WHERE source_key=?
+                """,
+                (source_key,),
+            ).fetchone()["last_seen_at"]
+        self.assertIsNone(last_seen_at)
+
+        self.assertTrue(
+            self.database.complete_recording_download_job(source_key)
+        )
+        self.assertFalse(self.database.is_retention_tombstoned(source_key))
+        self.assertFalse(self.database.recording_restore_requested(source_key))
+
+    def test_restore_cannot_finish_while_retention_cleanup_is_pending(self) -> None:
+        source_key = self.retain_recording(
+            "vehicle-one", "restore-pending-cleanup.mp4", 600
+        )
+        self.assertEqual(
+            self.database.request_recording_restore(source_key),
+            "vehicle-one",
+        )
+        self.assertTrue(
+            self.database.add_item(
+                source_key=source_key,
+                category="recordings",
+                subtype="drive",
+                vehicle="Test vehicle",
+                filename="restore-pending-cleanup.mp4",
+                relative_path="vehicles/test/restore-pending-cleanup.mp4",
+                media_type="video/mp4",
+                size_bytes=100,
+                sha256="b" * 64,
+                source_timestamp=600,
+                metadata={"restored": True},
+            )
+        )
+        with self.database.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO archive_retention_deletion_jobs(
+                    item_id,source_key,category,original_relative_path,
+                    staged_relative_path,prepared_at
+                ) VALUES(?,?,?,?,?,?)
+                """,
+                (
+                    999,
+                    source_key,
+                    "recordings",
+                    "vehicles/test/restore-pending-cleanup.mp4",
+                    "vehicles/test/.retention-999-test.pending",
+                    "2026-07-16T17:30:00+00:00",
+                ),
+            )
+
+        self.assertFalse(self.database.complete_recording_restore(source_key))
+        self.assertTrue(self.database.is_retention_tombstoned(source_key))
+        self.assertFalse(self.database.is_retention_protected(source_key))
+
+        with self.database.connect() as conn:
+            conn.execute(
+                "DELETE FROM archive_retention_deletion_jobs WHERE item_id=999"
+            )
+
+        self.assertTrue(self.database.complete_recording_restore(source_key))
+        self.assertFalse(self.database.is_retention_tombstoned(source_key))
+        self.assertTrue(self.database.is_retention_protected(source_key))
 
     def test_restore_request_fails_after_remote_item_disappears(self) -> None:
         source_key = self.retain_recording(

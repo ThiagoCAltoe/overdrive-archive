@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import tempfile
 import threading
 import unittest
@@ -8,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from app.db import Database
+from app.db import Database, RetentionCleanupPending
 from app.sync import RunTotals, SyncEngine
 
 
@@ -28,6 +29,7 @@ class RetentionTests(unittest.TestCase):
         age_days: int = 1,
         size: int = 10,
         sidecars: bool = False,
+        source_key: str | None = None,
     ) -> dict:
         recorded = datetime.now(timezone.utc) - timedelta(days=age_days)
         relative = Path("vehicles") / "car" / category / filename
@@ -42,7 +44,7 @@ class RetentionTests(unittest.TestCase):
             partial = path.with_suffix(path.suffix + ".part")
             partial.write_bytes(b"partial")
             partial.with_name(partial.name + ".meta").write_bytes(b"{}")
-        source_key = f"source:{category}:{filename}"
+        source_key = source_key or f"source:{category}:{filename}"
         self.assertTrue(
             self.db.add_item(
                 source_key=source_key,
@@ -349,6 +351,228 @@ class RetentionTests(unittest.TestCase):
 
         self.assertFalse(thumbnail.exists())
         self.assertEqual(self.db.list_retention_deletion_jobs(), [])
+
+    def test_remote_disappearance_waits_for_sidecar_cleanup_journal(self) -> None:
+        identity = "vehicle-one"
+        source_key = (
+            f"{identity}:recording:sidecar-remote-gone.mp4:1784196610000"
+        )
+        item = self._add_item(
+            "sidecar-remote-gone.mp4",
+            age_days=180,
+            sidecars=True,
+            source_key=source_key,
+        )
+        primary = self.engine.archive_root / item["relative_path"]
+        thumbnail = primary.with_suffix(".jpg")
+        original_unlink = Path.unlink
+
+        def guarded_unlink(path: Path, *args, **kwargs):
+            if path == thumbnail:
+                raise PermissionError("blocked sidecar for test")
+            return original_unlink(path, *args, **kwargs)
+
+        with patch.object(Path, "unlink", guarded_unlink):
+            result = self.engine.apply_retention(
+                self._save_recording_policy(age_days=1)
+            )
+
+        self.assertEqual(result["deleted_items"], 1)
+        self.assertEqual(result["error_count"], 1)
+        self.assertTrue(self.db.is_retention_tombstoned(source_key))
+        self.assertEqual(len(self.db.list_retention_deletion_jobs()), 1)
+
+        reconciliation = self.db.reconcile_recording_tombstones(identity, {})
+
+        self.assertEqual(reconciliation, {"updated": 0, "purged": 0})
+        self.assertTrue(self.db.is_retention_tombstoned(source_key))
+        self.assertEqual(len(self.db.list_retention_deletion_jobs()), 1)
+        self.assertTrue(
+            self.db.list_deleted_recordings(search="sidecar-remote")[0][
+                "cleanup_pending"
+            ]
+        )
+        with self.assertRaises(RetentionCleanupPending):
+            self.db.request_recording_restore(source_key)
+
+        self.assertEqual(self.engine._recover_retention_deletions(), 0)
+        self.assertFalse(thumbnail.exists())
+        self.assertEqual(self.db.list_retention_deletion_jobs(), [])
+        self.assertTrue(self.db.is_retention_tombstoned(source_key))
+        self.assertFalse(
+            self.db.list_deleted_recordings(search="sidecar-remote")[0][
+                "cleanup_pending"
+            ]
+        )
+
+        reconciliation = self.db.reconcile_recording_tombstones(identity, {})
+
+        self.assertEqual(reconciliation, {"updated": 0, "purged": 1})
+        self.assertFalse(self.db.is_retention_tombstoned(source_key))
+
+    def test_pending_restored_inventory_is_not_deleted_before_finalization(
+        self,
+    ) -> None:
+        source_key = (
+            "vehicle-one:recording:pending-restored.mp4:1784196610000"
+        )
+        original = self._add_item(
+            "pending-restored.mp4",
+            age_days=180,
+            source_key=source_key,
+        )
+        primary = self.engine.archive_root / original["relative_path"]
+        self.assertTrue(self.db.delete_archive_item(int(original["id"])))
+        self.assertEqual(
+            self.db.request_recording_restore(source_key),
+            "vehicle-one",
+        )
+        self.assertTrue(
+            self.db.add_item(
+                source_key=source_key,
+                category="recordings",
+                subtype="drive",
+                vehicle=str(original["vehicle"]),
+                filename=str(original["filename"]),
+                relative_path=str(original["relative_path"]),
+                media_type=str(original["media_type"]),
+                size_bytes=int(original["size_bytes"]),
+                sha256=str(original["sha256"]),
+                source_timestamp=int(original["source_timestamp"]),
+                metadata={"restored": True},
+            )
+        )
+
+        result = self.engine.apply_retention(
+            self._save_recording_policy(age_days=1)
+        )
+
+        self.assertEqual(result["deleted_items"], 0)
+        self.assertTrue(primary.is_file())
+        self.assertTrue(self.db.recording_restore_requested(source_key))
+        self.assertFalse(self.db.is_retention_protected(source_key))
+        self.assertIsNotNone(self.db.get_item_by_source_key(source_key))
+
+        self.assertTrue(self.db.complete_recording_restore(source_key))
+        self.assertTrue(self.db.is_retention_protected(source_key))
+
+    def test_cross_vehicle_partial_reference_blocks_cleanup_and_retention(
+        self,
+    ) -> None:
+        source_key = "vehicle-one:recording:cross-vehicle.mp4:1"
+        item = self._add_item(
+            "cross-vehicle.mp4",
+            age_days=180,
+            sidecars=True,
+            source_key=source_key,
+        )
+        primary = self.engine.archive_root / item["relative_path"]
+        partial = primary.with_suffix(primary.suffix + ".part")
+        partial_relative = str(partial.relative_to(self.engine.archive_root))
+        other_source = "vehicle-two:recording:cross-vehicle.mp4:2"
+        self.db.remember_recording_download_jobs(
+            "vehicle-two",
+            {other_source: {"filename": "cross-vehicle.mp4"}},
+            {other_source: partial_relative},
+        )
+
+        self.assertFalse(
+            self.engine._discard_vanished_recording_partial(
+                partial_relative,
+                source_key=source_key,
+            )
+        )
+        result = self.engine.apply_retention(
+            self._save_recording_policy(age_days=1)
+        )
+
+        self.assertEqual(result["deleted_items"], 0)
+        self.assertTrue(primary.is_file())
+        self.assertTrue(partial.is_file())
+        self.assertTrue(partial.with_name(partial.name + ".meta").is_file())
+        self.assertIsNotNone(self.db.get_item_by_source_key(source_key))
+
+    def test_pending_retention_cleanup_restores_primary_for_cross_vehicle_job(
+        self,
+    ) -> None:
+        source_key = "vehicle-one:recording:journal-cross-vehicle.mp4:1"
+        item = self._add_item(
+            "journal-cross-vehicle.mp4",
+            age_days=180,
+            sidecars=True,
+            source_key=source_key,
+        )
+        item_id = int(item["id"])
+        primary = self.engine.archive_root / item["relative_path"]
+        partial = primary.with_suffix(primary.suffix + ".part")
+        staged = primary.with_name(
+            f".retention-{item_id}-{'d' * 24}.pending"
+        )
+        self.assertIsNotNone(
+            self.db.prepare_retention_deletion(
+                item_id,
+                str(staged.relative_to(self.engine.archive_root)),
+            )
+        )
+        primary.replace(staged)
+        self.assertTrue(self.db.delete_archive_item(item_id))
+        other_source = "vehicle-two:recording:journal-cross-vehicle.mp4:2"
+        self.db.remember_recording_download_jobs(
+            "vehicle-two",
+            {other_source: {"filename": "journal-cross-vehicle.mp4"}},
+            {
+                other_source: str(
+                    partial.relative_to(self.engine.archive_root)
+                )
+            },
+        )
+
+        self.assertEqual(self.engine._recover_retention_deletions(), 1)
+
+        self.assertTrue(primary.is_file())
+        self.assertFalse(staged.exists())
+        self.assertTrue(partial.is_file())
+        self.assertEqual(len(self.db.list_retention_deletion_jobs()), 1)
+
+    def test_ownership_conflict_marker_blocks_retention(self) -> None:
+        source_key = "vehicle-one:recording:marked-conflict.mp4:1"
+        item = self._add_item(
+            "marked-conflict.mp4",
+            age_days=180,
+            sidecars=True,
+            source_key=source_key,
+        )
+        primary = self.engine.archive_root / item["relative_path"]
+        partial = primary.with_suffix(primary.suffix + ".part")
+        marker = partial.with_name(
+            partial.name + ".ownership-conflict.json"
+        )
+        marker.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "source_identities": [
+                        source_key,
+                        "vehicle-two:recording:marked-conflict.mp4:2",
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = self.engine.apply_retention(
+            self._save_recording_policy(age_days=1)
+        )
+
+        self.assertEqual(result["deleted_items"], 0)
+        self.assertTrue(primary.is_file())
+        self.assertTrue(partial.is_file())
+        self.assertTrue(marker.is_file())
+        self.assertIsNotNone(self.db.get_item_by_source_key(source_key))
+        self.assertIn(
+            marker,
+            self.engine._retention_sidecar_paths(primary, "recordings"),
+        )
 
     def test_storage_limit_deletes_oldest_unprotected_items_by_actual_bytes(self) -> None:
         oldest = self._add_item("oldest.mp4", age_days=3, size=10)

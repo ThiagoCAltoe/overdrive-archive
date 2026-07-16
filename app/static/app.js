@@ -267,12 +267,14 @@ const PT_BR_TEXT = {
   'Deleted locally': 'Apagado localmente',
   'Download again': 'Baixar novamente',
   'Restore queued': 'Restauração na fila',
+  'Local cleanup pending': 'Limpeza local pendente',
   'Requesting…': 'Solicitando…',
   '0 B stored': '0 B armazenados',
   'on vehicle': 'no veículo',
   'Only metadata is kept. This placeholder disappears after a complete vehicle listing confirms the recording is no longer on the vehicle.': 'Somente os metadados são mantidos. Este marcador desaparece depois que uma listagem completa do veículo confirma que a gravação não está mais nele.',
   'Synchronization started to download the recording again.': 'A sincronização foi iniciada para baixar a gravação novamente.',
   'Restore queued for the next synchronization.': 'Restauração colocada na fila para a próxima sincronização.',
+  'Local retention cleanup is still in progress. Try again shortly.': 'A limpeza da retenção local ainda está em andamento. Tente novamente em instantes.',
   'Protected from retention': 'Protegido contra retenção',
   'Use retention rules': 'Usar regras de retenção',
   'This removes the manual protection. Current retention rules may delete the local copy immediately. Continue?': 'Isso remove a proteção manual. As regras atuais de retenção podem apagar a cópia local imediatamente. Continuar?',
@@ -1310,8 +1312,10 @@ function renderDeletedLocalCard(item, label, grid) {
   const restore = document.createElement('button');
   restore.type = 'button';
   restore.className = 'button secondary small archive-restore';
-  restore.disabled = Boolean(item.restore_requested);
-  restore.textContent = t(item.restore_requested ? 'Restore queued' : 'Download again');
+  restore.disabled = Boolean(item.restore_requested || item.cleanup_pending);
+  restore.textContent = t(item.cleanup_pending
+    ? 'Local cleanup pending'
+    : item.restore_requested ? 'Restore queued' : 'Download again');
   restore.addEventListener('click', () => requestRecordingRestore(item, restore));
   footer.append(identity, restore);
   content.append(recorded, filename, explanation, footer);

@@ -14,6 +14,10 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+class RetentionCleanupPending(RuntimeError):
+    """A local deletion journal must finish before a restore can start."""
+
+
 class Database:
     def __init__(self, path: Path):
         self.path = path
@@ -333,6 +337,44 @@ class Database:
                     "ALTER TABLE recording_download_jobs ADD COLUMN "
                     "partial_relative_path TEXT NOT NULL DEFAULT ''"
                 )
+            legacy_partial_rows = conn.execute(
+                """
+                SELECT source_key,partial_relative_path
+                  FROM recording_download_jobs
+                 WHERE partial_relative_path<>''
+                """
+            ).fetchall()
+            normalized_partial_rows: list[tuple[str, str]] = []
+            for legacy_row in legacy_partial_rows:
+                raw_partial = str(legacy_row["partial_relative_path"])
+                try:
+                    normalized_partial = self._recording_partial_path(
+                        raw_partial, allow_empty=False
+                    )
+                except ValueError:
+                    # Preserve invalid hand-edited legacy state for explicit,
+                    # fail-safe handling instead of silently reinterpreting it.
+                    continue
+                if normalized_partial != raw_partial:
+                    normalized_partial_rows.append(
+                        (normalized_partial, str(legacy_row["source_key"]))
+                    )
+            if normalized_partial_rows:
+                conn.executemany(
+                    """
+                    UPDATE recording_download_jobs
+                       SET partial_relative_path=?
+                     WHERE source_key=?
+                    """,
+                    normalized_partial_rows,
+                )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_recording_download_jobs_partial
+                    ON recording_download_jobs(partial_relative_path)
+                    WHERE partial_relative_path<>''
+                """
+            )
             self._backfill_retention_tombstones(conn)
             row = conn.execute("SELECT 1 FROM settings WHERE id=1").fetchone()
             if row is None:
@@ -502,7 +544,10 @@ class Database:
             or any(ord(character) < 32 for character in value)
         ):
             raise ValueError("Recording partial path is invalid.")
-        return value
+        # Path collapses redundant separators, ``.`` segments, and a trailing
+        # slash. Persisting this canonical form makes equality correspond to
+        # the same physical archive path for every vehicle identity.
+        return str(partial)
 
     @staticmethod
     def _canonical_json_metadata(value: Any) -> str:
@@ -682,6 +727,23 @@ class Database:
             )
         return jobs
 
+    def recording_download_job_sources_for_partial(
+        self, partial_relative_path: str
+    ) -> set[str]:
+        """Return every source referencing a partial path across all vehicles."""
+        partial = self._recording_partial_path(
+            partial_relative_path, allow_empty=False
+        )
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT source_key FROM recording_download_jobs
+                 WHERE partial_relative_path=?
+                """,
+                (partial,),
+            ).fetchall()
+        return {str(row["source_key"]) for row in rows}
+
     def update_recording_download_job_partial_path(
         self, source_key: str, partial_relative_path: str
     ) -> bool:
@@ -710,8 +772,40 @@ class Database:
         return cursor.rowcount == 1
 
     def complete_recording_download_job(self, source_key: str) -> bool:
-        """Remove a job after its recording has been archived successfully."""
-        return self.delete_recording_download_job(source_key)
+        """Finish a job and retire a missing restore placeholder when safe."""
+        normalized = self._recording_job_identity(source_key, "Source key")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute(
+                "DELETE FROM recording_download_jobs WHERE source_key=?",
+                (normalized,),
+            )
+            if cursor.rowcount != 1:
+                return False
+            # Reconciliation leaves a requested restore in place while its
+            # durable job may still recover a completed local copy. If the job
+            # instead finishes without an inventory row, the remote-missing
+            # marker can now be removed in the same transaction.
+            conn.execute(
+                """
+                DELETE FROM archive_retention_tombstones
+                 WHERE source_key=? AND category='recordings'
+                   AND restore_requested_at IS NOT NULL
+                   AND last_seen_at IS NULL
+                   AND NOT EXISTS (
+                       SELECT 1 FROM archive_items AS item
+                        WHERE item.source_key=
+                              archive_retention_tombstones.source_key
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM archive_retention_deletion_jobs AS job
+                        WHERE job.source_key=
+                              archive_retention_tombstones.source_key
+                   )
+                """,
+                (normalized,),
+            )
+        return True
 
     def reconcile_recording_tombstones(
         self,
@@ -814,22 +908,76 @@ class Database:
                     ),
                 )
 
-            if missing_keys:
-                conn.executemany(
+            purged = 0
+            for source_key in sorted(missing_keys):
+                # A requested restore may already have a complete final file,
+                # or a durable job capable of recovering one. Mark the remote
+                # copy missing, but preserve the request until that job either
+                # creates the protected inventory row or safely finishes with
+                # no local copy.
+                conn.execute(
+                    """
+                    UPDATE archive_retention_tombstones
+                       SET last_seen_at=NULL
+                     WHERE source_key=? AND category='recordings'
+                       AND vehicle_identity=?
+                       AND restore_requested_at IS NOT NULL
+                       AND (
+                           EXISTS (
+                               SELECT 1 FROM recording_download_jobs AS job
+                                WHERE job.source_key=
+                                      archive_retention_tombstones.source_key
+                           )
+                           OR EXISTS (
+                               SELECT 1 FROM archive_items AS item
+                                WHERE item.source_key=
+                                      archive_retention_tombstones.source_key
+                                  AND item.category='recordings'
+                           )
+                       )
+                    """,
+                    (source_key, identity),
+                )
+                # Cleanup recovery needs the tombstone to distinguish a
+                # committed local deletion from a pre-commit staging move.
+                # A restorable local/download state likewise owns the restore
+                # request until finalization reaches a durable boundary.
+                cursor = conn.execute(
                     """
                     DELETE FROM archive_retention_tombstones
                      WHERE source_key=? AND category='recordings'
                        AND vehicle_identity=?
+                       AND NOT EXISTS (
+                           SELECT 1 FROM archive_retention_deletion_jobs AS job
+                           WHERE job.source_key=
+                                  archive_retention_tombstones.source_key
+                       )
+                       AND NOT (
+                           restore_requested_at IS NOT NULL
+                           AND (
+                               EXISTS (
+                                   SELECT 1 FROM recording_download_jobs AS job
+                                    WHERE job.source_key=
+                                          archive_retention_tombstones.source_key
+                               )
+                               OR EXISTS (
+                                   SELECT 1 FROM archive_items AS item
+                                    WHERE item.source_key=
+                                          archive_retention_tombstones.source_key
+                                      AND item.category='recordings'
+                               )
+                           )
+                       )
                     """,
-                    ((source_key, identity) for source_key in sorted(missing_keys)),
+                    (source_key, identity),
                 )
+                purged += cursor.rowcount
 
-                # A missing tombstone can still have a resumable restore job.
-                # Keep the job until SyncEngine has deterministically removed
-                # its .part and .part.meta artifacts. The engine deletes the
-                # job only after that cleanup succeeds.
+            # A missing tombstone can still have a resumable restore job. Keep
+            # the job until SyncEngine has deterministically removed its .part
+            # and .part.meta artifacts; the engine deletes it after cleanup.
 
-        return {"updated": len(present_keys), "purged": len(missing_keys)}
+        return {"updated": len(present_keys), "purged": purged}
 
     def list_deleted_recordings(
         self,
@@ -865,8 +1013,12 @@ class Database:
                 f"""
                 SELECT source_key,category,subtype,vehicle,filename,
                        source_timestamp,0 AS size_bytes,remote_size_bytes,
-                       deleted_at,last_seen_at,restore_requested_at
-                  FROM archive_retention_tombstones
+                       deleted_at,last_seen_at,restore_requested_at,
+                       EXISTS(
+                           SELECT 1 FROM archive_retention_deletion_jobs AS job
+                            WHERE job.source_key=tombstone.source_key
+                       ) AS cleanup_pending
+                  FROM archive_retention_tombstones AS tombstone
                   {where}
                  ORDER BY CASE
                      WHEN source_timestamp IS NULL OR source_timestamp<=0
@@ -887,21 +1039,35 @@ class Database:
             conn.execute("BEGIN IMMEDIATE")
             tombstone = conn.execute(
                 """
-                SELECT vehicle_identity
-                  FROM archive_retention_tombstones
-                 WHERE source_key=? AND category='recordings'
-                   AND last_seen_at IS NOT NULL
+                SELECT tombstone.vehicle_identity,
+                       EXISTS(
+                           SELECT 1 FROM archive_retention_deletion_jobs AS job
+                            WHERE job.source_key=tombstone.source_key
+                       ) AS cleanup_pending
+                  FROM archive_retention_tombstones AS tombstone
+                 WHERE tombstone.source_key=?
+                   AND tombstone.category='recordings'
+                   AND tombstone.last_seen_at IS NOT NULL
                 """,
                 (normalized,),
             ).fetchone()
             if tombstone is None:
                 return None
+            if bool(tombstone["cleanup_pending"]):
+                raise RetentionCleanupPending(
+                    "Local retention cleanup is still in progress."
+                )
             cursor = conn.execute(
                 """
                 UPDATE archive_retention_tombstones
                    SET restore_requested_at=COALESCE(restore_requested_at,?)
                  WHERE source_key=? AND category='recordings'
                    AND last_seen_at IS NOT NULL
+                   AND NOT EXISTS (
+                       SELECT 1 FROM archive_retention_deletion_jobs AS job
+                        WHERE job.source_key=
+                              archive_retention_tombstones.source_key
+                   )
                 """,
                 (utc_now(), normalized),
             )
@@ -918,6 +1084,21 @@ class Database:
                 SELECT 1 FROM archive_retention_tombstones
                  WHERE source_key=? AND category='recordings'
                    AND restore_requested_at IS NOT NULL
+                """,
+                (source_key,),
+            ).fetchone()
+        return row is not None
+
+    def recording_retention_cleanup_pending(self, source_key: str) -> bool:
+        """Return whether local deletion cleanup blocks a recording restore."""
+        if not isinstance(source_key, str) or not source_key:
+            return False
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT 1 FROM archive_retention_deletion_jobs
+                 WHERE source_key=? AND category='recordings'
+                 LIMIT 1
                 """,
                 (source_key,),
             ).fetchone()
@@ -946,13 +1127,30 @@ class Database:
             conn.execute("BEGIN IMMEDIATE")
             tombstone = conn.execute(
                 """
-                SELECT category FROM archive_retention_tombstones
-                 WHERE source_key=? AND category='recordings'
-                   AND restore_requested_at IS NOT NULL
+                SELECT tombstone.category
+                  FROM archive_retention_tombstones AS tombstone
+                 WHERE tombstone.source_key=?
+                   AND tombstone.category='recordings'
+                   AND tombstone.restore_requested_at IS NOT NULL
+                   AND EXISTS (
+                       SELECT 1 FROM archive_items AS item
+                        WHERE item.source_key=tombstone.source_key
+                          AND item.category='recordings'
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM archive_retention_deletion_jobs AS job
+                        WHERE job.source_key=tombstone.source_key
+                   )
                 """,
                 (normalized,),
             ).fetchone()
             if tombstone is None:
+                return False
+            cursor = conn.execute(
+                "DELETE FROM archive_retention_tombstones WHERE source_key=?",
+                (normalized,),
+            )
+            if cursor.rowcount != 1:
                 return False
             conn.execute(
                 """
@@ -965,11 +1163,7 @@ class Database:
                 """,
                 (normalized, str(tombstone["category"]), utc_now()),
             )
-            cursor = conn.execute(
-                "DELETE FROM archive_retention_tombstones WHERE source_key=?",
-                (normalized,),
-            )
-        return cursor.rowcount == 1
+        return True
 
     def list_retention_protected_source_keys(
         self, category: str | None = None
@@ -1166,6 +1360,13 @@ class Database:
             normalized_category = category.strip()
 
         clauses: list[str] = []
+        clauses.append(
+            "NOT EXISTS ("
+            "SELECT 1 FROM archive_retention_tombstones AS tombstone "
+            "WHERE tombstone.source_key=item.source_key "
+            "AND tombstone.category=item.category "
+            "AND tombstone.restore_requested_at IS NOT NULL)"
+        )
         if not include_protected:
             clauses.append(
                 "NOT EXISTS ("
@@ -1210,10 +1411,15 @@ class Database:
                 SELECT item.source_key,item.category,item.vehicle,item.filename,
                        item.subtype,item.source_timestamp,item.size_bytes,
                        item.metadata_json
-                  FROM archive_items AS item
+                 FROM archive_items AS item
                  WHERE item.id=? AND NOT EXISTS (
                        SELECT 1 FROM archive_retention_protections AS protection
                         WHERE protection.source_key=item.source_key
+                 ) AND NOT EXISTS (
+                       SELECT 1 FROM archive_retention_tombstones AS tombstone
+                        WHERE tombstone.source_key=item.source_key
+                          AND tombstone.category=item.category
+                          AND tombstone.restore_requested_at IS NOT NULL
                  )
                 """,
                 (normalized_id,),
@@ -1300,6 +1506,11 @@ class Database:
                  WHERE id=? AND NOT EXISTS (
                        SELECT 1 FROM archive_retention_protections AS protection
                         WHERE protection.source_key=item.source_key
+                 ) AND NOT EXISTS (
+                       SELECT 1 FROM archive_retention_tombstones AS tombstone
+                        WHERE tombstone.source_key=item.source_key
+                          AND tombstone.category=item.category
+                          AND tombstone.restore_requested_at IS NOT NULL
                  )
                 """,
                 (normalized_id,),

@@ -500,8 +500,17 @@ Recordings are:
 5. checked against the expected Overdrive size when available;
 6. hashed with SHA-256;
 7. flushed to disk;
-8. atomically renamed;
-9. added to the SQLite inventory.
+8. bound to a durable completion proof containing its source identity, size,
+   and SHA-256;
+9. atomically renamed;
+10. added to the SQLite inventory with its optional sidecars;
+11. stripped of temporary resume and completion metadata only after the
+    inventory commit succeeds.
+
+If Overdrive rotates a clip after all bytes arrived but before inventory or
+sidecar creation finishes, the next run validates and archives that completed
+local copy. Ambiguous or unverifiable partial data is preserved instead of
+being silently deleted or presented as a valid video.
 
 Queue progress is weighted by expected bytes, not file count. A 1 GiB partial
 inside a 10 GiB known-size queue therefore reports 10%. If any queued item has

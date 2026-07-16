@@ -32,7 +32,7 @@ from .config import (
     redact_settings,
     validate_settings,
 )
-from .db import Database
+from .db import Database, RetentionCleanupPending
 from .overdrive import OverdriveClient, OverdriveError
 from .sync import SyncEngine
 
@@ -560,6 +560,7 @@ class Handler(BaseHTTPRequestHandler):
         """Expose only the metadata needed to identify and restore a deleted clip."""
         deleted_at = str(item.get("deleted_at") or "")
         restore_requested_at = str(item.get("restore_requested_at") or "")
+        cleanup_pending = bool(item.get("cleanup_pending"))
         return {
             "id": None,
             "category": "recordings",
@@ -572,6 +573,7 @@ class Handler(BaseHTTPRequestHandler):
             "last_seen_at": str(item.get("last_seen_at") or ""),
             "restore_requested_at": restore_requested_at,
             "restore_requested": bool(restore_requested_at),
+            "cleanup_pending": cleanup_pending,
             "source_key": str(item.get("source_key") or ""),
             "deleted_local": True,
             "size_bytes": 0,
@@ -762,15 +764,26 @@ class Handler(BaseHTTPRequestHandler):
         source_key = source_key.strip()
         try:
             restore_identity = self.server.db.request_recording_restore(source_key)
+        except RetentionCleanupPending:
+            self._json(
+                409,
+                {
+                    "error": (
+                        "Local retention cleanup is still in progress. "
+                        "Try again shortly."
+                    ),
+                    "code": "retention_cleanup_pending",
+                },
+            )
+            return
         except ValueError:
             self._json(400, {"error": "A valid source_key is required."})
             return
         if not restore_identity:
             self._json(404, {"error": "Deleted recording not found."})
             return
-        current_identity = self.server.engine.configured_vehicle_identity()
         sync_started = bool(
-            restore_identity == current_identity
+            self.server.engine.can_start_recording_restore(restore_identity)
             and self.server.engine.trigger("restore")
         )
         self._json(

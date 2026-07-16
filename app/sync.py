@@ -26,7 +26,7 @@ from .config import (
     wifi_policy,
 )
 from .db import Database
-from .overdrive import OverdriveClient, OverdriveError
+from .overdrive import OverdriveClient, OverdriveError, is_bearer_jwt
 
 
 log = logging.getLogger("overdrive_archive.sync")
@@ -266,6 +266,8 @@ class SyncEngine:
         self._retention_lock = threading.Lock()
         self._retention_active = False
         self._last_retention_check = 0.0
+        self._observed_vehicle_connection = ""
+        self._observed_vehicle_identity = ""
         self._recover_retention_deletions()
 
     def start_scheduler(self) -> None:
@@ -474,6 +476,7 @@ class SyncEngine:
         errors: list[str] = []
         network_type = "unknown"
         settings = self.db.get_settings()
+        connection_fingerprint = self._vehicle_connection_fingerprint(settings)
         client = self._client(settings)
         self._set_state(stage="connecting", current="Authenticating with Overdrive")
 
@@ -516,7 +519,25 @@ class SyncEngine:
 
             selected = set(settings["content"]["categories"])
             current_identity = self._vehicle_identity(settings)
-            if self.db.has_pending_recording_restores(current_identity):
+            with self._state_lock:
+                self._observed_vehicle_connection = connection_fingerprint
+                self._observed_vehicle_identity = current_identity
+            pending_restore = self.db.has_pending_recording_restores(current_identity)
+            if reason == "restore" and not pending_restore:
+                message = "Requested recording belongs to another vehicle."
+                self.db.finish_run(
+                    run_id,
+                    status="skipped",
+                    items_added=0,
+                    items_skipped=0,
+                    error_count=0,
+                    bytes_added=0,
+                    network_type=network_type,
+                    message=message,
+                )
+                self._set_state(stage="waiting", current=message)
+                return {"status": "skipped", "message": message}
+            if pending_restore:
                 selected.add("recordings")
             trip_cache: dict[str, Any] | None = None
             for category in CATEGORIES:
@@ -829,7 +850,26 @@ class SyncEngine:
             primary.with_suffix(".events.json"),
             partial,
             partial.with_name(partial.name + ".meta"),
+            partial.with_name(partial.name + ".complete.json"),
+            partial.with_name(partial.name + ".ownership-conflict.json"),
         ]
+
+    def _retention_recording_artifacts_in_use(
+        self, primary: Path, category: str
+    ) -> bool:
+        """Protect recording bytes referenced by any vehicle or conflict marker."""
+        if category != "recordings":
+            return False
+        partial = primary.with_suffix(primary.suffix + ".part")
+        partial_relative = str(
+            partial.relative_to(self.archive_root.resolve())
+        )
+        if self.db.recording_download_job_sources_for_partial(partial_relative):
+            return True
+        conflict = partial.with_name(
+            partial.name + ".ownership-conflict.json"
+        )
+        return self._path_lstat(conflict) is not None
 
     @staticmethod
     def _path_lstat(path: Path) -> os.stat_result | None:
@@ -945,6 +985,41 @@ class SyncEngine:
                 continue
 
             try:
+                artifacts_in_use = self._retention_recording_artifacts_in_use(
+                    original, str(job.get("category") or "")
+                )
+            except (OSError, TypeError, ValueError):
+                log.exception(
+                    "Retention could not verify recording jobs for item %s",
+                    item_id,
+                )
+                errors += 1
+                continue
+            if artifacts_in_use:
+                try:
+                    original_info = self._path_lstat(original)
+                    staged_info = self._path_lstat(staged)
+                    if staged_info is not None:
+                        if (
+                            stat.S_ISDIR(staged_info.st_mode)
+                            or original_info is not None
+                        ):
+                            raise OSError(
+                                "conflicting primary paths block retention rollback"
+                            )
+                        staged.replace(original)
+                except OSError:
+                    log.exception(
+                        "Retention could not preserve referenced item %s", item_id
+                    )
+                else:
+                    log.warning(
+                        "Retention deferred referenced recording item %s", item_id
+                    )
+                errors += 1
+                continue
+
+            try:
                 shared_path = (
                     self.db.count_archive_path_references(
                         str(job.get("original_relative_path") or "")
@@ -1033,6 +1108,20 @@ class SyncEngine:
             log.error("Retention refused an unsafe archive item path for item %s", item.get("id"))
             return False, 0, True
         item_id = int(item["id"])
+        category = str(item.get("category") or "")
+        try:
+            if self._retention_recording_artifacts_in_use(primary, category):
+                log.warning(
+                    "Retention deferred recording item %s because its artifacts "
+                    "are still referenced",
+                    item_id,
+                )
+                return False, 0, False
+        except (OSError, TypeError, ValueError):
+            log.exception(
+                "Retention could not verify recording jobs for item %s", item_id
+            )
+            return False, 0, True
         try:
             shared_path = (
                 self.db.count_archive_path_references(
@@ -1104,10 +1193,31 @@ class SyncEngine:
         if not transitioned:
             self._recover_retention_deletions()
             return False, 0, True
+        try:
+            artifacts_in_use = self._retention_recording_artifacts_in_use(
+                primary, category
+            )
+        except (OSError, TypeError, ValueError):
+            log.exception(
+                "Retention could not recheck recording jobs for item %s", item_id
+            )
+            artifacts_in_use = True
+        if artifacts_in_use:
+            try:
+                if self._path_lstat(primary) is not None:
+                    raise OSError(
+                        "original recording path reappeared during retention"
+                    )
+                staged_primary.replace(primary)
+            except OSError:
+                log.exception(
+                    "Retention could not preserve newly referenced item %s", item_id
+                )
+            return True, 0, True
         cleanup_paths = [staged_primary]
         cleanup_paths.extend(
             self._retention_sidecar_paths(
-                primary, str(item.get("category") or "")
+                primary, category
             )
         )
         freed, cleanup_ok = self._unlink_retention_paths(cleanup_paths)
@@ -1152,6 +1262,48 @@ class SyncEngine:
         """Return the stable identity implied by the saved vehicle settings."""
         return self._vehicle_identity(self.db.get_settings())
 
+    @staticmethod
+    def _vehicle_connection_fingerprint(settings: dict[str, Any]) -> str:
+        vehicle = settings["vehicle"]
+        seed = "\0".join(
+            (
+                str(vehicle.get("base_url") or "").strip().casefold(),
+                str(vehicle.get("device_token") or "").strip(),
+            )
+        )
+        return hashlib.sha256(seed.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _configured_vehicle_identity_is_authoritative(
+        settings: dict[str, Any],
+    ) -> bool:
+        vehicle = settings["vehicle"]
+        device_id = str(vehicle.get("device_id") or "").strip()
+        if device_id and device_id != "unknown":
+            return True
+        token = str(vehicle.get("device_token") or "").strip()
+        return bool(token and not is_bearer_jwt(token) and "-" in token)
+
+    def can_start_recording_restore(self, restore_identity: str) -> bool:
+        """Allow a restore sync when the saved identity matches or needs probing."""
+        if not isinstance(restore_identity, str) or not restore_identity:
+            return False
+        settings = self.db.get_settings()
+        fingerprint = self._vehicle_connection_fingerprint(settings)
+        with self._state_lock:
+            observed_identity = (
+                self._observed_vehicle_identity
+                if self._observed_vehicle_connection == fingerprint
+                else ""
+            )
+        if observed_identity:
+            return restore_identity == observed_identity
+        configured_identity = self._vehicle_identity(settings)
+        return (
+            restore_identity == configured_identity
+            or not self._configured_vehicle_identity_is_authoritative(settings)
+        )
+
     def _vehicle_identity(self, settings: dict[str, Any]) -> str:
         vehicle = settings["vehicle"]
         device_id = str(vehicle.get("device_id") or "").strip()
@@ -1159,7 +1311,11 @@ class SyncEngine:
             seed = f"device-id:{device_id.casefold()}"
         else:
             token = str(vehicle.get("device_token") or "").strip()
-            token_prefix = token.rsplit("-", 1)[0].strip() if "-" in token else ""
+            token_prefix = (
+                token.rsplit("-", 1)[0].strip()
+                if token and not is_bearer_jwt(token) and "-" in token
+                else ""
+            )
             if token_prefix:
                 seed = f"device-id:{token_prefix.casefold()}"
             else:
@@ -1300,6 +1456,8 @@ class SyncEngine:
     def _discard_vanished_recording_partial(
         self,
         partial_relative_path: Any,
+        *,
+        source_key: str,
     ) -> bool:
         """Remove only resumable artifacts for a vanished vehicle job."""
         try:
@@ -1314,9 +1472,29 @@ class SyncEngine:
             log.warning("Refusing to clean an unsafe vanished recording job")
             return False
 
+        if not source_key.partition(":recording:")[0]:
+            return False
+        normalized_relative = str(relative)
+        try:
+            other_references = self._recording_partial_references(
+                normalized_relative
+            ) - {source_key}
+        except (RuntimeError, ValueError):
+            return False
+        if other_references:
+            log.warning(
+                "Refusing to clean recording artifacts still referenced by %s",
+                ", ".join(sorted(other_references)),
+            )
+            return False
+
         paths = (
             partial_path,
             partial_path.with_name(partial_path.name + ".meta"),
+            partial_path.with_name(partial_path.name + ".complete.json"),
+            partial_path.with_name(
+                partial_path.name + ".ownership-conflict.json"
+            ),
         )
         for path in paths:
             try:
@@ -1333,6 +1511,600 @@ class SyncEngine:
             except OSError:
                 return False
         return True
+
+    @staticmethod
+    def _recording_completion_path(partial_path: Path) -> Path:
+        return partial_path.with_name(partial_path.name + ".complete.json")
+
+    @staticmethod
+    def _recording_conflict_path(partial_path: Path) -> Path:
+        return partial_path.with_name(
+            partial_path.name + ".ownership-conflict.json"
+        )
+
+    def _persist_recording_path_conflict(
+        self, partial_path: Path, source_keys: set[str]
+    ) -> bool:
+        try:
+            self._write_json(
+                self._recording_conflict_path(partial_path),
+                {
+                    "version": 1,
+                    "source_identities": sorted(source_keys),
+                },
+            )
+        except OSError:
+            return False
+        return True
+
+    @staticmethod
+    def _read_recording_sidecar(path: Path) -> tuple[bool, dict[str, Any] | None]:
+        """Read a bounded regular JSON sidecar without following symlinks."""
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            return False, None
+        except OSError:
+            return True, None
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 64 * 1024:
+            return True, None
+        try:
+            descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return True, None
+        return True, payload if isinstance(payload, dict) else None
+
+    def _recording_shared_path_owner(
+        self,
+        partial_path: Path,
+        source_keys: set[str],
+    ) -> str | None:
+        """Return the sole sidecar-proven owner, or None for any ambiguity."""
+        identities: list[str] = []
+        try:
+            partial_info = self._path_lstat(partial_path)
+        except OSError:
+            return None
+        meta_exists, meta = self._read_recording_sidecar(
+            OverdriveClient._partial_metadata_path(partial_path)
+        )
+        if meta_exists:
+            if (
+                meta is None
+                or not isinstance(meta.get("source_identity"), str)
+                or not isinstance(meta.get("expected_size"), int)
+                or isinstance(meta.get("expected_size"), bool)
+                or int(meta["expected_size"]) < 0
+                or not isinstance(meta.get("total_size"), int)
+                or isinstance(meta.get("total_size"), bool)
+                or not 0 < int(meta["total_size"]) <= self.max_recording_bytes
+                or meta.get("validator_header") not in {"etag", "last-modified"}
+                or not isinstance(meta.get("validator_value"), str)
+                or not meta.get("validator_value")
+            ):
+                return None
+            if (
+                partial_info is None
+                or not stat.S_ISREG(partial_info.st_mode)
+                or partial_info.st_size > int(meta["total_size"])
+            ):
+                return None
+            identities.append(str(meta["source_identity"]))
+
+        proof_exists, proof = self._read_recording_sidecar(
+            self._recording_completion_path(partial_path)
+        )
+        if proof_exists:
+            if (
+                proof is None
+                or proof.get("version") != 1
+                or not isinstance(proof.get("source_identity"), str)
+                or not isinstance(proof.get("size"), int)
+                or isinstance(proof.get("size"), bool)
+                or not 0 < int(proof["size"]) <= self.max_recording_bytes
+                or re.fullmatch(
+                    r"[0-9a-f]{64}", str(proof.get("sha256") or "").lower()
+                )
+                is None
+            ):
+                return None
+            final_path = partial_path.with_name(partial_path.name[:-5])
+            try:
+                final_info = self._path_lstat(final_path)
+            except OSError:
+                return None
+            if final_info is not None:
+                # A completion proof authenticates the final object, not a
+                # second coexisting .part. Only concordant resume metadata can
+                # prove that the latter belongs to the same source.
+                if partial_info is not None and not meta_exists:
+                    return None
+                candidate = final_path
+                candidate_info = final_info
+            else:
+                if partial_info is None:
+                    return None
+                candidate = partial_path
+                candidate_info = partial_info
+            try:
+                if not stat.S_ISREG(candidate_info.st_mode) or (
+                    candidate_info.st_size != int(proof["size"])
+                ):
+                    return None
+                proof_size, proof_digest = self._hash_file(candidate)
+            except SyncCancelled:
+                raise
+            except OSError:
+                return None
+            if (
+                proof_size != int(proof["size"])
+                or proof_digest
+                != str(proof.get("sha256") or "").lower()
+            ):
+                return None
+            identities.append(str(proof["source_identity"]))
+
+        if not identities or len(set(identities)) != 1:
+            return None
+        owner = identities[0]
+        return owner if owner in source_keys else None
+
+    def _recording_partial_references(
+        self,
+        partial_relative_path: str,
+    ) -> set[str]:
+        return self.db.recording_download_job_sources_for_partial(
+            partial_relative_path
+        )
+
+    def _reroute_recording_job_partial(
+        self,
+        settings: dict[str, Any],
+        *,
+        identity: str,
+        vehicle: str,
+        stored: dict[str, Any],
+        blocked_paths: set[str],
+    ) -> bool:
+        source_key = str(stored.get("source_key") or "")
+        item = stored.get("item")
+        if not isinstance(item, dict):
+            return False
+        try:
+            filename, _subtype, timestamp_ms, relative, final_path = (
+                self._recording_archive_path(
+                    settings, item, identity=identity, vehicle=vehicle
+                )
+            )
+            if source_key != f"{identity}:recording:{filename}:{timestamp_ms}":
+                return False
+            partial = final_path.with_suffix(final_path.suffix + ".part")
+            partial_relative = str(partial.relative_to(self.archive_root.resolve()))
+            if partial_relative in blocked_paths:
+                source_digest = hashlib.sha256(source_key.encode("utf-8")).hexdigest()
+                final_path = self._safe_archive_path(
+                    relative.parent / f"source-{source_digest}" / filename
+                )
+                partial = final_path.with_suffix(final_path.suffix + ".part")
+                partial_relative = str(
+                    partial.relative_to(self.archive_root.resolve())
+                )
+            if partial_relative in blocked_paths:
+                return False
+            if not self.db.update_recording_download_job_partial_path(
+                source_key, partial_relative
+            ):
+                return False
+            blocked_paths.add(partial_relative)
+            return True
+        except (OSError, TypeError, ValueError, OverdriveError):
+            return False
+
+    def _write_recording_completion_proof(
+        self,
+        partial_path: Path,
+        *,
+        source_key: str,
+        size: int,
+        digest: str,
+    ) -> None:
+        normalized_digest = str(digest).lower()
+        if (
+            size <= 0
+            or size > self.max_recording_bytes
+            or re.fullmatch(r"[0-9a-f]{64}", normalized_digest) is None
+        ):
+            raise OverdriveError(
+                "Completed recording verification metadata is invalid."
+            )
+        try:
+            self._write_json(
+                self._recording_completion_path(partial_path),
+                {
+                    "version": 1,
+                    "source_identity": source_key,
+                    "size": size,
+                    "sha256": normalized_digest,
+                },
+            )
+        except OSError as exc:
+            raise OverdriveError(
+                "Could not persist completed recording verification metadata."
+            ) from exc
+
+    def _load_recording_completion_proof(
+        self,
+        partial_path: Path,
+        *,
+        source_key: str,
+        expected_size: int,
+    ) -> tuple[int, str] | None:
+        path = self._recording_completion_path(partial_path)
+        try:
+            info = path.lstat()
+            if not stat.S_ISREG(info.st_mode) or info.st_size > 64 * 1024:
+                return None
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(path, flags)
+            with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        raw_size = payload.get("size")
+        if not isinstance(raw_size, int) or isinstance(raw_size, bool):
+            return None
+        size = raw_size
+        digest = str(payload.get("sha256") or "").lower()
+        if (
+            payload.get("version") != 1
+            or payload.get("source_identity") != source_key
+            or size <= 0
+            or size > self.max_recording_bytes
+            or (expected_size and size != expected_size)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        ):
+            return None
+        return size, digest
+
+    def _inventory_recording_file_is_valid(
+        self,
+        item: dict[str, Any],
+    ) -> bool:
+        """Verify that an inventory row still owns the bytes it describes."""
+        try:
+            if str(item.get("category") or "") != "recordings":
+                return False
+            path = self._retention_safe_path(item.get("relative_path"))
+            info = path.lstat()
+            if not stat.S_ISREG(info.st_mode):
+                return False
+            expected_size = max(0, int(item.get("size_bytes") or 0))
+            expected_digest = str(item.get("sha256") or "").lower()
+            if (
+                info.st_size != expected_size
+                or re.fullmatch(r"[0-9a-f]{64}", expected_digest) is None
+            ):
+                return False
+            size, digest = self._hash_file(path)
+            return size == expected_size and digest == expected_digest
+        except SyncCancelled:
+            raise
+        except (OSError, TypeError, ValueError):
+            return False
+
+    def _recover_vanished_recording(
+        self,
+        client: OverdriveClient,
+        settings: dict[str, Any],
+        content: dict[str, Any],
+        totals: RunTotals,
+        *,
+        identity: str,
+        vehicle: str,
+        stored: dict[str, Any],
+        partial_relative_path: str,
+        policy_check: Callable[[], None],
+    ) -> bool:
+        """Archive a verified completed transfer before retiring a vanished job.
+
+        A recording can disappear from Overdrive after its last byte was
+        downloaded but before the local sidecars and inventory row were
+        committed.  The persisted effective ``.part`` path is the recovery
+        anchor.  Ambiguous bytes are deliberately retained with the job for a
+        later/manual recovery instead of being treated as disposable resume
+        data.
+        """
+        source_key = str(stored.get("source_key") or "")
+        item = stored.get("item")
+        if not isinstance(item, dict):
+            return False
+        existing = self.db.get_item_by_source_key(source_key)
+        if existing is not None and self._inventory_recording_file_is_valid(existing):
+            try:
+                self._finalize_recording_restore(source_key)
+            except OverdriveError:
+                return False
+            return self._discard_vanished_recording_partial(
+                partial_relative_path, source_key=source_key
+            )
+
+        try:
+            filename, subtype, timestamp_ms, _canonical_relative, _canonical_path = (
+                self._recording_archive_path(
+                    settings,
+                    item,
+                    identity=identity,
+                    vehicle=vehicle,
+                )
+            )
+            if source_key != f"{identity}:recording:{filename}:{timestamp_ms}":
+                raise ValueError("Stored recording identity is inconsistent.")
+            try:
+                expected_size = max(0, int(item.get("size") or 0))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("Stored recording size is invalid.") from exc
+            if expected_size > self.max_recording_bytes:
+                raise ValueError("Stored recording exceeds the configured size limit.")
+            partial_path = self._retention_safe_path(partial_relative_path)
+            if (
+                len(partial_path.name) <= len(".part")
+                or not partial_path.name.endswith(".part")
+            ):
+                raise ValueError("Stored recording partial path is invalid.")
+            final_path = partial_path.with_name(partial_path.name[:-5])
+            if final_path.name != filename:
+                raise ValueError("Stored recording path does not match its filename.")
+            relative = final_path.relative_to(self.archive_root.resolve())
+            if self.db.archive_path_has_other_source(str(relative), source_key):
+                raise ValueError("Stored recording path belongs to another source.")
+        except (OSError, TypeError, ValueError):
+            log.warning(
+                "Keeping vanished recording job %s because its recovery metadata "
+                "or path is invalid",
+                source_key,
+            )
+            return False
+
+        try:
+            final_info = final_path.lstat()
+        except FileNotFoundError:
+            final_info = None
+        except OSError:
+            return False
+        try:
+            partial_info = partial_path.lstat()
+        except FileNotFoundError:
+            partial_info = None
+        except OSError:
+            return False
+
+        coexisting_final_and_part = (
+            final_info is not None and partial_info is not None
+        )
+        if (
+            final_info is not None
+            and partial_info is not None
+            and not stat.S_ISREG(partial_info.st_mode)
+        ):
+            self._persist_recording_path_conflict(partial_path, {source_key})
+            return False
+
+        if final_info is not None:
+            if not stat.S_ISREG(final_info.st_mode):
+                return False
+            candidate = final_path
+            candidate_size = int(final_info.st_size)
+        elif partial_info is not None:
+            if not stat.S_ISREG(partial_info.st_mode):
+                return False
+            candidate = partial_path
+            candidate_size = int(partial_info.st_size)
+        else:
+            # A sidecar without bytes cannot be a completed recording.
+            return self._discard_vanished_recording_partial(
+                partial_relative_path, source_key=source_key
+            )
+
+        metadata_path = OverdriveClient._partial_metadata_path(partial_path)
+        try:
+            metadata_info = metadata_path.lstat()
+        except FileNotFoundError:
+            metadata_info = None
+        except OSError:
+            return False
+        completion_path = self._recording_completion_path(partial_path)
+        try:
+            completion_info = completion_path.lstat()
+        except FileNotFoundError:
+            completion_info = None
+        except OSError:
+            return False
+        if coexisting_final_and_part and completion_info is None:
+            self._persist_recording_path_conflict(partial_path, {source_key})
+            return False
+
+        # A short deterministic part is known not to be the completed object,
+        # even when an interrupted writer left an invalid metadata sidecar.
+        if expected_size and candidate_size < expected_size:
+            if candidate == partial_path:
+                return self._discard_vanished_recording_partial(
+                    partial_relative_path, source_key=source_key
+                )
+            return False
+        if expected_size and candidate_size > expected_size:
+            return False
+
+        resume_metadata: dict[str, Any] | None = None
+        if metadata_info is not None:
+            if not stat.S_ISREG(metadata_info.st_mode):
+                if coexisting_final_and_part:
+                    self._persist_recording_path_conflict(
+                        partial_path, {source_key}
+                    )
+                return False
+            resume_metadata = OverdriveClient._load_partial_metadata(
+                partial_path,
+                source_identity=source_key,
+                expected_size=expected_size,
+            )
+            if resume_metadata is None:
+                if coexisting_final_and_part:
+                    self._persist_recording_path_conflict(
+                        partial_path, {source_key}
+                    )
+                return False
+        elif coexisting_final_and_part:
+            self._persist_recording_path_conflict(partial_path, {source_key})
+            return False
+
+        completion_proof: tuple[int, str] | None = None
+        if completion_info is not None:
+            if not stat.S_ISREG(completion_info.st_mode):
+                if coexisting_final_and_part:
+                    self._persist_recording_path_conflict(
+                        partial_path, {source_key}
+                    )
+                return False
+            completion_proof = self._load_recording_completion_proof(
+                partial_path,
+                source_key=source_key,
+                expected_size=expected_size,
+            )
+            if completion_proof is None:
+                if coexisting_final_and_part:
+                    self._persist_recording_path_conflict(
+                        partial_path, {source_key}
+                    )
+                return False
+
+        if (
+            candidate == partial_path
+            and resume_metadata is None
+            and completion_proof is None
+        ):
+            log.warning(
+                "Keeping vanished recording job %s because a full .part without "
+                "validated transfer metadata cannot prove completion",
+                source_key,
+            )
+            return False
+
+        verified_size = completion_proof[0] if completion_proof else expected_size
+        if not verified_size and resume_metadata is not None:
+            verified_size = int(resume_metadata["total_size"])
+        if verified_size > self.max_recording_bytes:
+            log.warning(
+                "Keeping vanished recording job %s because its verified size "
+                "exceeds the configured recording limit",
+                source_key,
+            )
+            return False
+        if not verified_size:
+            log.warning(
+                "Keeping vanished recording job %s because completion cannot be "
+                "proven without a source size or valid resume metadata",
+                source_key,
+            )
+            return False
+        if candidate_size < verified_size:
+            if candidate == partial_path:
+                return self._discard_vanished_recording_partial(
+                    partial_relative_path, source_key=source_key
+                )
+            return False
+        if candidate_size != verified_size:
+            return False
+
+        try:
+            size, digest = self._hash_file(candidate)
+        except SyncCancelled:
+            raise
+        except OSError:
+            return False
+        if size != verified_size:
+            return False
+        if completion_proof is not None and digest != completion_proof[1]:
+            log.warning(
+                "Keeping vanished recording job %s because its SHA-256 does not "
+                "match the durable completion proof",
+                source_key,
+            )
+            return False
+
+        if candidate == partial_path:
+            try:
+                # ``final_path`` was observed missing above. Never overwrite a
+                # second local object while recovering the only verified copy.
+                if final_path.exists() or final_path.is_symlink():
+                    return False
+                os.replace(partial_path, final_path)
+            except OSError:
+                return False
+        try:
+            os.chmod(final_path, 0o600)
+        except OSError:
+            pass
+
+        entry = RecordingQueueEntry(
+            item=dict(item),
+            source_key=source_key,
+            filename=filename,
+            subtype=subtype,
+            timestamp_ms=timestamp_ms,
+            expected_size=expected_size,
+            relative=relative,
+            final_path=final_path,
+            partial_path=partial_path,
+            existing=existing,
+            needs_download=False,
+            partial_size=0,
+            known_before_run=True,
+        )
+        try:
+            self._inventory_recording(
+                client,
+                settings,
+                content,
+                totals,
+                vehicle,
+                entry,
+                size,
+                digest,
+                policy_check,
+            )
+        except (PolicyPause, SyncCancelled):
+            raise
+        except (OSError, OverdriveError) as exc:
+            log.warning(
+                "Keeping recovered recording %s for an inventory retry: %s",
+                filename,
+                exc,
+            )
+            return False
+
+        inventoried = self.db.get_item_by_source_key(source_key)
+        if (
+            inventoried is None
+            or str(inventoried.get("category") or "") != "recordings"
+            or str(inventoried.get("relative_path") or "") != str(relative)
+            or int(inventoried.get("size_bytes") or -1) != size
+            or str(inventoried.get("sha256") or "").lower() != digest
+        ):
+            return False
+
+        try:
+            self._finalize_recording_restore(source_key)
+        except OverdriveError:
+            return False
+        # Resume metadata remains useful proof until inventory is durable.
+        # Remove it, and any stale second part, only after that point.
+        return self._discard_vanished_recording_partial(
+            partial_relative_path, source_key=source_key
+        )
 
     def _build_recording_queue_entry(
         self,
@@ -1437,8 +2209,6 @@ class SyncEngine:
                 source_identity=source_key,
                 expected_size=expected_size,
             )
-        else:
-            OverdriveClient._discard_partial(partial_path)
 
         return RecordingQueueEntry(
             item=dict(item),
@@ -1513,7 +2283,10 @@ class SyncEngine:
         self.db.reconcile_recording_tombstones(identity, all_live_jobs)
         live_jobs: dict[str, dict[str, Any]] = {}
         for source_key, item in all_live_jobs.items():
-            restore_requested = self.db.recording_restore_requested(source_key)
+            restore_requested = (
+                self.db.recording_restore_requested(source_key)
+                and not self.db.recording_retention_cleanup_pending(source_key)
+            )
             if restore_requested or (
                 not self.db.is_retention_tombstoned(source_key)
                 and self._recording_is_selected(
@@ -1535,12 +2308,171 @@ class SyncEngine:
         )
         new_keys = set(live_jobs) - known_live_keys
         persisted_jobs = self.db.list_recording_download_jobs(identity)
-        current_partial_paths = {
-            str(stored.get("partial_relative_path") or "")
-            for stored in persisted_jobs
-            if str(stored["source_key"]) in all_live_jobs
-            and str(stored.get("partial_relative_path") or "")
+        jobs_by_partial: dict[str, list[dict[str, Any]]] = {}
+        for stored in persisted_jobs:
+            stored_partial = str(stored.get("partial_relative_path") or "")
+            if stored_partial:
+                jobs_by_partial.setdefault(stored_partial, []).append(stored)
+
+        blocked_paths = set(jobs_by_partial)
+        ambiguous_shared_paths: set[str] = set()
+        for shared_relative, shared_jobs in jobs_by_partial.items():
+            if len(shared_jobs) < 2:
+                continue
+            source_keys = {str(job["source_key"]) for job in shared_jobs}
+            shared_path: Path | None = None
+            try:
+                shared_path = self._retention_safe_path(shared_relative)
+                owner = self._recording_shared_path_owner(
+                    shared_path, source_keys
+                )
+            except (OSError, TypeError, ValueError):
+                owner = None
+
+            if owner is None:
+                ambiguous_shared_paths.add(shared_relative)
+                if shared_path is None or not self._persist_recording_path_conflict(
+                    shared_path, source_keys
+                ):
+                    log.warning(
+                        "Keeping ambiguous shared recording path because its "
+                        "ownership conflict could not be persisted"
+                    )
+                    continue
+
+            # A live source that does not provably own legacy shared artifacts
+            # must get a fresh source-owned path before download_to can discard
+            # or overwrite anything.
+            for shared_job in shared_jobs:
+                job_key = str(shared_job["source_key"])
+                if job_key not in all_live_jobs or job_key == owner:
+                    continue
+                if not self._reroute_recording_job_partial(
+                    settings,
+                    identity=identity,
+                    vehicle=vehicle,
+                    stored=shared_job,
+                    blocked_paths=blocked_paths,
+                ):
+                    log.warning(
+                        "Keeping shared recording job %s because a unique path "
+                        "could not be persisted",
+                        job_key,
+                    )
+
+            if owner is None:
+                continue
+
+            # Sidecars prove that vanished aliases do not own this artifact.
+            # Retire those aliases without touching the owner path.
+            for shared_job in shared_jobs:
+                job_key = str(shared_job["source_key"])
+                if job_key == owner or job_key in all_live_jobs:
+                    continue
+                existing_alias = self.db.get_item_by_source_key(job_key)
+                if (
+                    existing_alias is not None
+                    and self._inventory_recording_file_is_valid(existing_alias)
+                ):
+                    try:
+                        self._finalize_recording_restore(job_key)
+                    except OverdriveError:
+                        continue
+                self.db.complete_recording_download_job(job_key)
+
+        persisted_jobs = self.db.list_recording_download_jobs(identity)
+        shared_after_resolution: dict[str, set[str]] = {}
+        for stored in persisted_jobs:
+            stored_partial = str(stored.get("partial_relative_path") or "")
+            if stored_partial:
+                shared_after_resolution.setdefault(stored_partial, set()).add(
+                    str(stored["source_key"])
+                )
+        unresolved_shared_paths = {
+            path for path, owners in shared_after_resolution.items() if len(owners) > 1
         }
+        unresolved_shared_paths.update(
+            path
+            for path in ambiguous_shared_paths
+            if path in shared_after_resolution
+        )
+        for path, owners in shared_after_resolution.items():
+            if path in unresolved_shared_paths:
+                continue
+            try:
+                partial_path = self._retention_safe_path(path)
+                conflict_exists, _conflict = self._read_recording_sidecar(
+                    self._recording_conflict_path(partial_path)
+                )
+                proven_owner = self._recording_shared_path_owner(
+                    partial_path, owners
+                )
+            except (OSError, TypeError, ValueError):
+                conflict_exists = True
+                proven_owner = None
+            if conflict_exists and proven_owner not in owners:
+                unresolved_shared_paths.add(path)
+
+        # Recover a source-bound completed live transfer before attempting any
+        # new vehicle GET. This covers a crash after the final byte/proof but
+        # before rename, sidecars, or inventory.
+        for stored in list(persisted_jobs):
+            source_key = str(stored["source_key"])
+            partial_relative = str(stored.get("partial_relative_path") or "")
+            if (
+                source_key not in all_live_jobs
+                or not partial_relative
+                or partial_relative in unresolved_shared_paths
+            ):
+                continue
+            try:
+                partial_path = self._retention_safe_path(partial_relative)
+                proof_exists, _proof = self._read_recording_sidecar(
+                    self._recording_completion_path(partial_path)
+                )
+                partial_info = self._path_lstat(partial_path)
+                final_info = self._path_lstat(
+                    partial_path.with_name(partial_path.name[:-5])
+                )
+                coexisting_final_and_part = (
+                    partial_info is not None and final_info is not None
+                )
+            except (OSError, TypeError, ValueError):
+                unresolved_shared_paths.add(partial_relative)
+                continue
+            if coexisting_final_and_part and not proof_exists:
+                self._persist_recording_path_conflict(
+                    partial_path, {source_key}
+                )
+                unresolved_shared_paths.add(partial_relative)
+                continue
+            if not proof_exists and not coexisting_final_and_part:
+                continue
+            proven_owner = self._recording_shared_path_owner(
+                partial_path, {source_key}
+            )
+            if proven_owner != source_key:
+                self._persist_recording_path_conflict(
+                    partial_path, {source_key}
+                )
+                unresolved_shared_paths.add(partial_relative)
+                continue
+            if not proof_exists:
+                continue
+            if self._recover_vanished_recording(
+                client,
+                settings,
+                content,
+                totals,
+                identity=identity,
+                vehicle=vehicle,
+                stored=stored,
+                partial_relative_path=partial_relative,
+                policy_check=policy_check,
+            ):
+                self.db.complete_recording_download_job(source_key)
+
+        persisted_jobs = self.db.list_recording_download_jobs(identity)
         stored_rows: list[dict[str, Any]] = []
         for stored in persisted_jobs:
             self._check_cancelled()
@@ -1561,19 +2493,45 @@ class SyncEngine:
                             self.archive_root.resolve()
                         )
                     )
-                # Never remove artifacts that an effective, persisted live job
-                # owns, including paths retained from an older app version.
-                if (
-                    stored_partial not in current_partial_paths
-                    and not self._discard_vanished_recording_partial(stored_partial)
+                if stored_partial in unresolved_shared_paths:
+                    log.warning(
+                        "Keeping vanished recording job %s because its partial "
+                        "path has no unique source-bound owner",
+                        source_key,
+                    )
+                    continue
+                if not self._recover_vanished_recording(
+                    client,
+                    settings,
+                    content,
+                    totals,
+                    identity=identity,
+                    vehicle=vehicle,
+                    stored=stored,
+                    partial_relative_path=stored_partial,
+                    policy_check=policy_check,
                 ):
                     log.warning(
-                        "Keeping vanished recording job %s because its resumable "
-                        "artifacts could not be cleaned safely",
+                        "Keeping vanished recording job %s because its local "
+                        "artifacts could not be recovered or cleaned safely",
                         source_key,
                     )
                     continue
                 self.db.complete_recording_download_job(source_key)
+                continue
+            if str(stored.get("partial_relative_path") or "") in (
+                unresolved_shared_paths
+            ):
+                log.warning(
+                    "Skipping live recording job %s because its shared partial "
+                    "path could not be resolved safely",
+                    source_key,
+                )
+                continue
+            if self.db.recording_retention_cleanup_pending(source_key):
+                # A durable local deletion still owns this source. Preserve any
+                # queued restore job, but never write a replacement until its
+                # staged primary and sidecars have reached a safe boundary.
                 continue
             restore_requested = self.db.recording_restore_requested(source_key)
             if self.db.is_retention_tombstoned(source_key) and not restore_requested:
@@ -1700,14 +2658,44 @@ class SyncEngine:
                 digest,
                 policy_check,
             )
-            if self.db.recording_restore_requested(entry.source_key):
-                self.db.complete_recording_restore(entry.source_key)
+            self._finalize_recording_restore(entry.source_key)
+            self._finalize_recording_resume_artifacts(
+                entry.partial_path, entry.source_key
+            )
             self.db.complete_recording_download_job(entry.source_key)
 
         if transfer_failures:
             raise OverdriveError(
                 f"{len(transfer_failures)} recording(s) remain queued; "
                 f"first failure: {transfer_failures[0]}"
+            )
+
+    def _finalize_recording_restore(self, source_key: str) -> None:
+        if self.db.recording_restore_requested(source_key) and not (
+            self.db.complete_recording_restore(source_key)
+        ):
+            # Keep the download job for a retry instead of exposing a restored
+            # item without its retention protection.
+            raise OverdriveError(
+                "Could not safely finalize the restored recording."
+            )
+
+    def _finalize_recording_resume_artifacts(
+        self, partial_path: Path, source_key: str
+    ) -> None:
+        try:
+            partial_relative = str(
+                partial_path.relative_to(self.archive_root.resolve())
+            )
+        except ValueError as exc:
+            raise OverdriveError(
+                "Could not safely finalize recording resume metadata."
+            ) from exc
+        if not self._discard_vanished_recording_partial(
+            partial_relative, source_key=source_key
+        ):
+            raise OverdriveError(
+                "Could not safely finalize recording resume metadata."
             )
 
     def _download_recording_queue_entry(
@@ -1739,27 +2727,41 @@ class SyncEngine:
                 f"Recording size mismatch for {entry.filename}: "
                 f"expected {entry.expected_size}, received {size}."
             )
+        self._write_recording_completion_proof(
+            entry.partial_path,
+            source_key=entry.source_key,
+            size=size,
+            digest=digest,
+        )
         update_progress(size, entry.expected_size)
         os.replace(entry.partial_path, entry.final_path)
-        OverdriveClient.discard_resume_metadata(entry.partial_path)
         try:
             os.chmod(entry.final_path, 0o600)
         except OSError:
             pass
         totals.bytes_added += size
-        self._inventory_recording(
-            client,
-            settings,
-            content,
-            totals,
-            vehicle,
-            entry,
-            size,
-            digest,
-            policy_check,
+        try:
+            self._inventory_recording(
+                client,
+                settings,
+                content,
+                totals,
+                vehicle,
+                entry,
+                size,
+                digest,
+                policy_check,
+            )
+        except (PolicyPause, SyncCancelled):
+            raise
+        except OSError as exc:
+            raise OverdriveError(
+                f"Could not persist archive sidecars for {entry.filename}."
+            ) from exc
+        self._finalize_recording_restore(entry.source_key)
+        self._finalize_recording_resume_artifacts(
+            entry.partial_path, entry.source_key
         )
-        if self.db.recording_restore_requested(entry.source_key):
-            self.db.complete_recording_restore(entry.source_key)
         self.db.complete_recording_download_job(entry.source_key)
 
     def _inventory_recording(
@@ -2300,7 +3302,17 @@ class SyncEngine:
     def _hash_file(self, path: Path) -> tuple[int, str]:
         digest = hashlib.sha256()
         size = 0
-        with path.open("rb") as handle:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        try:
+            info = os.fstat(descriptor)
+        except OSError:
+            os.close(descriptor)
+            raise
+        if not stat.S_ISREG(info.st_mode):
+            os.close(descriptor)
+            raise OSError("Recording hash source is not a regular file.")
+        with os.fdopen(descriptor, "rb") as handle:
             while True:
                 self._check_cancelled()
                 chunk = handle.read(1024 * 1024)
