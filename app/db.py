@@ -5,7 +5,7 @@ import os
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from .config import default_settings, validate_settings
 
@@ -47,6 +47,92 @@ class Database:
                 os.chmod(path, 0o600)
             except OSError:
                 pass
+
+    @staticmethod
+    def _recording_source_parts(
+        source_key: str,
+    ) -> tuple[str, str, int | None]:
+        vehicle_identity, marker, remainder = source_key.partition(":recording:")
+        if not marker or not vehicle_identity:
+            return "", "", None
+        filename, timestamp_marker, raw_timestamp = remainder.rpartition(":")
+        if not timestamp_marker:
+            filename = remainder
+            raw_timestamp = ""
+        try:
+            timestamp = int(raw_timestamp) if raw_timestamp else None
+        except (TypeError, ValueError, OverflowError):
+            timestamp = None
+        return vehicle_identity, filename[:255], timestamp
+
+    @staticmethod
+    def _recording_subtype_hint(
+        item: dict[str, Any], filename: str, fallback: str = ""
+    ) -> str:
+        source_type = str(item.get("type") or "").strip()
+        known = {
+            "replay": "replay",
+            "sentry": "surveillance",
+            "proximity": "proximity",
+            "oemDashcam": "oem_dashcam",
+            "oem_dashcam": "oem_dashcam",
+        }
+        if source_type in known:
+            return known[source_type]
+        lower_name = filename.casefold()
+        if lower_name.startswith("replay_"):
+            return "replay"
+        if lower_name.startswith("dvr_"):
+            return "oem_dashcam"
+        if lower_name.startswith("event_"):
+            return "surveillance"
+        if lower_name.startswith("proximity_"):
+            return "proximity"
+        if source_type == "normal" or lower_name.startswith("cam"):
+            return "drive"
+        return fallback[:40]
+
+    @classmethod
+    def _backfill_retention_tombstones(
+        cls, conn: sqlite3.Connection
+    ) -> None:
+        conn.execute(
+            """
+            UPDATE archive_retention_tombstones
+               SET last_seen_at=deleted_at
+             WHERE last_seen_at IS NULL
+            """
+        )
+        rows = conn.execute(
+            """
+            SELECT source_key,vehicle_identity,filename,subtype,
+                   source_timestamp
+              FROM archive_retention_tombstones
+             WHERE category='recordings'
+            """
+        ).fetchall()
+        for row in rows:
+            identity, filename, timestamp = cls._recording_source_parts(
+                str(row["source_key"])
+            )
+            current_filename = str(row["filename"] or "")
+            current_subtype = str(row["subtype"] or "")
+            conn.execute(
+                """
+                UPDATE archive_retention_tombstones
+                   SET vehicle_identity=?,filename=?,subtype=?,
+                       source_timestamp=COALESCE(source_timestamp,?)
+                 WHERE source_key=?
+                """,
+                (
+                    str(row["vehicle_identity"] or "") or identity,
+                    current_filename or filename,
+                    current_subtype
+                    or cls._recording_subtype_hint({}, current_filename or filename),
+                    timestamp,
+                    str(row["source_key"]),
+                ),
+            )
 
     def _initialize(self) -> None:
         with self.connect() as conn:
@@ -96,6 +182,39 @@ class Database:
                     ON archive_items(created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_archive_items_category
                     ON archive_items(category, created_at DESC);
+
+                CREATE TABLE IF NOT EXISTS archive_retention_tombstones (
+                    source_key TEXT PRIMARY KEY,
+                    category TEXT NOT NULL,
+                    deleted_at TEXT NOT NULL,
+                    vehicle_identity TEXT NOT NULL DEFAULT '',
+                    vehicle TEXT NOT NULL DEFAULT '',
+                    filename TEXT NOT NULL DEFAULT '',
+                    subtype TEXT NOT NULL DEFAULT '',
+                    source_timestamp INTEGER,
+                    remote_size_bytes INTEGER NOT NULL DEFAULT 0,
+                    item_json TEXT NOT NULL DEFAULT '{}',
+                    last_seen_at TEXT,
+                    restore_requested_at TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS archive_retention_protections (
+                    source_key TEXT PRIMARY KEY,
+                    category TEXT NOT NULL,
+                    protected_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS recording_download_jobs (
+                    source_key TEXT PRIMARY KEY,
+                    vehicle_identity TEXT NOT NULL,
+                    item_json TEXT NOT NULL,
+                    first_seen_at TEXT NOT NULL,
+                    last_seen_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_recording_download_jobs_vehicle
+                    ON recording_download_jobs(
+                        vehicle_identity, first_seen_at, source_key
+                    );
 
                 CREATE TABLE IF NOT EXISTS users (
                     username TEXT PRIMARY KEY,
@@ -168,6 +287,32 @@ class Database:
                     ON archive_items(category, subtype, created_at DESC)
                 """
             )
+            tombstone_columns = {
+                str(row["name"])
+                for row in conn.execute(
+                    "PRAGMA table_info(archive_retention_tombstones)"
+                ).fetchall()
+            }
+            tombstone_migrations = {
+                "vehicle_identity": (
+                    "TEXT NOT NULL DEFAULT ''"
+                ),
+                "vehicle": "TEXT NOT NULL DEFAULT ''",
+                "filename": "TEXT NOT NULL DEFAULT ''",
+                "subtype": "TEXT NOT NULL DEFAULT ''",
+                "source_timestamp": "INTEGER",
+                "remote_size_bytes": "INTEGER NOT NULL DEFAULT 0",
+                "item_json": "TEXT NOT NULL DEFAULT '{}'",
+                "last_seen_at": "TEXT",
+                "restore_requested_at": "TEXT",
+            }
+            for name, declaration in tombstone_migrations.items():
+                if name not in tombstone_columns:
+                    conn.execute(
+                        "ALTER TABLE archive_retention_tombstones "
+                        f"ADD COLUMN {name} {declaration}"
+                    )
+            self._backfill_retention_tombstones(conn)
             row = conn.execute("SELECT 1 FROM settings WHERE id=1").fetchone()
             if row is None:
                 payload = json.dumps(default_settings(), separators=(",", ":"))
@@ -277,7 +422,511 @@ class Database:
         return [dict(row) for row in rows]
 
     def has_item(self, source_key: str) -> bool:
-        return self.get_item_by_source_key(source_key) is not None
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT (
+                    EXISTS(
+                        SELECT 1 FROM archive_items WHERE source_key=?
+                    ) OR EXISTS(
+                        SELECT 1 FROM archive_retention_tombstones
+                         WHERE source_key=?
+                    )
+                ) AS known
+                """,
+                (source_key, source_key),
+            ).fetchone()
+        return bool(row["known"]) if row else False
+
+    def is_retention_tombstoned(self, source_key: str) -> bool:
+        if not isinstance(source_key, str) or not source_key:
+            return False
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT 1 FROM archive_retention_tombstones
+                 WHERE source_key=?
+                """,
+                (source_key,),
+            ).fetchone()
+        return row is not None
+
+    @staticmethod
+    def _recording_job_identity(value: str, label: str) -> str:
+        if not isinstance(value, str):
+            raise ValueError(f"{label} must be text.")
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError(f"{label} is required.")
+        if len(normalized) > 1000 or any(
+            ord(character) < 32 for character in normalized
+        ):
+            raise ValueError(f"{label} is invalid.")
+        return normalized
+
+    @staticmethod
+    def _canonical_json_metadata(value: Any) -> str:
+        if not isinstance(value, (dict, list)):
+            raise ValueError("Metadata must be a JSON object or array.")
+        try:
+            return json.dumps(
+                value,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "Metadata must contain valid JSON values."
+            ) from exc
+
+    @classmethod
+    def _canonical_recording_job_json(cls, item: dict[str, Any]) -> str:
+        if not isinstance(item, dict):
+            raise ValueError("A recording download job item must be a JSON object.")
+        try:
+            return cls._canonical_json_metadata(item)
+        except ValueError as exc:
+            raise ValueError(
+                "A recording download job item must contain valid JSON values."
+            ) from exc
+
+    @classmethod
+    def _canonical_stored_metadata(cls, raw_payload: Any) -> str:
+        try:
+            decoded = json.loads(raw_payload)
+            return cls._canonical_json_metadata(decoded)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return "{}"
+
+    def remember_recording_download_jobs(
+        self,
+        vehicle_identity: str,
+        jobs: Mapping[str, dict[str, Any]],
+    ) -> set[str]:
+        """Remember one discovery batch and return keys known before the batch.
+
+        Serialization is completed before opening the transaction, so one bad
+        vehicle item cannot leave a partially remembered discovery batch.
+        """
+        identity = self._recording_job_identity(
+            vehicle_identity, "Vehicle identity"
+        )
+        if not isinstance(jobs, Mapping):
+            raise ValueError("Recording download jobs must be a mapping.")
+
+        prepared: list[tuple[str, str]] = []
+        for raw_source_key, item in jobs.items():
+            source_key = self._recording_job_identity(raw_source_key, "Source key")
+            prepared.append(
+                (source_key, self._canonical_recording_job_json(item))
+            )
+        if not prepared:
+            return set()
+
+        source_keys = {source_key for source_key, _payload in prepared}
+        seen_at = utc_now()
+        with self.connect() as conn:
+            # The preexisting-key snapshot and every upsert are one atomic
+            # discovery operation, including when two sync triggers race.
+            conn.execute("BEGIN IMMEDIATE")
+            existing: dict[str, str] = {}
+            ordered_keys = sorted(source_keys)
+            for offset in range(0, len(ordered_keys), 500):
+                chunk = ordered_keys[offset : offset + 500]
+                placeholders = ",".join("?" for _key in chunk)
+                rows = conn.execute(
+                    f"""
+                    SELECT source_key, vehicle_identity
+                      FROM recording_download_jobs
+                     WHERE source_key IN ({placeholders})
+                    """,
+                    chunk,
+                ).fetchall()
+                existing.update(
+                    {
+                        str(row["source_key"]): str(row["vehicle_identity"])
+                        for row in rows
+                    }
+                )
+
+            mismatched = sorted(
+                source_key
+                for source_key, stored_identity in existing.items()
+                if stored_identity != identity
+            )
+            if mismatched:
+                raise ValueError(
+                    "A recording download source key belongs to another vehicle."
+                )
+
+            conn.executemany(
+                """
+                INSERT INTO recording_download_jobs(
+                    source_key,vehicle_identity,item_json,first_seen_at,last_seen_at
+                ) VALUES(?,?,?,?,?)
+                ON CONFLICT(source_key) DO UPDATE SET
+                    item_json=excluded.item_json,
+                    last_seen_at=excluded.last_seen_at
+                """,
+                (
+                    (source_key, identity, payload, seen_at, seen_at)
+                    for source_key, payload in prepared
+                ),
+            )
+        return set(existing)
+
+    def list_recording_download_jobs(
+        self, vehicle_identity: str
+    ) -> list[dict[str, Any]]:
+        identity = self._recording_job_identity(
+            vehicle_identity, "Vehicle identity"
+        )
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT source_key,vehicle_identity,item_json,
+                       first_seen_at,last_seen_at
+                  FROM recording_download_jobs
+                 WHERE vehicle_identity=?
+                 ORDER BY first_seen_at,source_key
+                """,
+                (identity,),
+            ).fetchall()
+
+        jobs: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                item = json.loads(row["item_json"])
+            except (json.JSONDecodeError, TypeError) as exc:
+                raise RuntimeError(
+                    "A stored recording download job contains invalid JSON."
+                ) from exc
+            if not isinstance(item, dict):
+                raise RuntimeError(
+                    "A stored recording download job is not a JSON object."
+                )
+            jobs.append(
+                {
+                    "source_key": str(row["source_key"]),
+                    "vehicle_identity": str(row["vehicle_identity"]),
+                    "item": item,
+                    "first_seen_at": str(row["first_seen_at"]),
+                    "last_seen_at": str(row["last_seen_at"]),
+                }
+            )
+        return jobs
+
+    def delete_recording_download_job(self, source_key: str) -> bool:
+        normalized = self._recording_job_identity(source_key, "Source key")
+        with self.connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM recording_download_jobs WHERE source_key=?",
+                (normalized,),
+            )
+        return cursor.rowcount == 1
+
+    def complete_recording_download_job(self, source_key: str) -> bool:
+        """Remove a job after its recording has been archived successfully."""
+        return self.delete_recording_download_job(source_key)
+
+    def reconcile_recording_tombstones(
+        self,
+        vehicle_identity: str,
+        live_jobs: Mapping[str, dict[str, Any]],
+    ) -> dict[str, int]:
+        """Reconcile one vehicle after its complete remote listing is known."""
+        identity = self._recording_job_identity(
+            vehicle_identity, "Vehicle identity"
+        )
+        if not isinstance(live_jobs, Mapping):
+            raise ValueError("Live recording jobs must be a mapping.")
+
+        prepared: dict[str, dict[str, Any]] = {}
+        for raw_source_key, item in live_jobs.items():
+            source_key = self._recording_job_identity(raw_source_key, "Source key")
+            source_identity, key_filename, key_timestamp = (
+                self._recording_source_parts(source_key)
+            )
+            if source_identity != identity:
+                raise ValueError(
+                    "A live recording source key belongs to another vehicle."
+                )
+            payload = self._canonical_recording_job_json(item)
+            raw_filename = item.get("filename")
+            filename = (
+                raw_filename.strip()[:255]
+                if isinstance(raw_filename, str)
+                and raw_filename.strip()
+                and all(ord(character) >= 32 for character in raw_filename)
+                else key_filename
+            )
+            timestamp: int | None = key_timestamp
+            raw_timestamp = item.get("timestamp")
+            if raw_timestamp is not None:
+                try:
+                    timestamp = int(raw_timestamp)
+                except (TypeError, ValueError, OverflowError):
+                    timestamp = key_timestamp
+            try:
+                remote_size = max(
+                    0, int(item.get("size") or item.get("size_bytes") or 0)
+                )
+            except (TypeError, ValueError, OverflowError):
+                remote_size = 0
+            prepared[source_key] = {
+                "item_json": payload,
+                "filename": filename,
+                "subtype": self._recording_subtype_hint(item, filename),
+                "source_timestamp": timestamp,
+                "remote_size_bytes": remote_size,
+            }
+
+        observed_at = utc_now()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                """
+                SELECT source_key,filename,subtype,source_timestamp,
+                       remote_size_bytes
+                  FROM archive_retention_tombstones
+                 WHERE category='recordings' AND vehicle_identity=?
+                """,
+                (identity,),
+            ).fetchall()
+            tombstones = {str(row["source_key"]): row for row in rows}
+            present_keys = set(tombstones).intersection(prepared)
+            missing_keys = set(tombstones).difference(prepared)
+
+            for source_key in sorted(present_keys):
+                current = tombstones[source_key]
+                incoming = prepared[source_key]
+                filename = str(incoming["filename"] or current["filename"] or "")
+                subtype = str(
+                    incoming["subtype"] or current["subtype"] or ""
+                )
+                timestamp = incoming["source_timestamp"]
+                if timestamp is None:
+                    timestamp = current["source_timestamp"]
+                remote_size = int(incoming["remote_size_bytes"] or 0)
+                if remote_size <= 0:
+                    remote_size = max(0, int(current["remote_size_bytes"] or 0))
+                conn.execute(
+                    """
+                    UPDATE archive_retention_tombstones
+                       SET filename=?,subtype=?,source_timestamp=?,
+                           remote_size_bytes=?,item_json=?,last_seen_at=?
+                     WHERE source_key=? AND category='recordings'
+                       AND vehicle_identity=?
+                    """,
+                    (
+                        filename,
+                        subtype,
+                        timestamp,
+                        remote_size,
+                        str(incoming["item_json"]),
+                        observed_at,
+                        source_key,
+                        identity,
+                    ),
+                )
+
+            if missing_keys:
+                conn.executemany(
+                    """
+                    DELETE FROM archive_retention_tombstones
+                     WHERE source_key=? AND category='recordings'
+                       AND vehicle_identity=?
+                    """,
+                    ((source_key, identity) for source_key in sorted(missing_keys)),
+                )
+                conn.executemany(
+                    "DELETE FROM recording_download_jobs WHERE source_key=?",
+                    ((source_key,) for source_key in sorted(missing_keys)),
+                )
+
+        return {"updated": len(present_keys), "purged": len(missing_keys)}
+
+    def list_deleted_recordings(
+        self,
+        *,
+        category: str = "recordings",
+        subtype: str = "",
+        search: str = "",
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        limit = max(1, min(int(limit), 250))
+        clauses: list[str] = []
+        arguments: list[Any] = []
+        if category:
+            clauses.append("category=?")
+            arguments.append(category)
+        if subtype:
+            clauses.append("subtype=?")
+            arguments.append(subtype)
+        if search:
+            escaped = (
+                search.replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_")
+            )
+            clauses.append(
+                "(filename LIKE ? ESCAPE '\\' OR vehicle LIKE ? ESCAPE '\\')"
+            )
+            arguments.extend((f"%{escaped}%", f"%{escaped}%"))
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        arguments.append(limit)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT source_key,category,subtype,vehicle,filename,
+                       source_timestamp,0 AS size_bytes,remote_size_bytes,
+                       deleted_at,last_seen_at,restore_requested_at
+                  FROM archive_retention_tombstones
+                  {where}
+                 ORDER BY CASE
+                     WHEN source_timestamp IS NULL OR source_timestamp<=0
+                         THEN CAST(strftime('%s', deleted_at) AS INTEGER) * 1000
+                     WHEN source_timestamp<10000000000
+                         THEN source_timestamp * 1000
+                     ELSE source_timestamp
+                 END DESC, source_key
+                 LIMIT ?
+                """,
+                arguments,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def request_recording_restore(self, source_key: str) -> str | None:
+        normalized = self._recording_job_identity(source_key, "Source key")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            tombstone = conn.execute(
+                """
+                SELECT vehicle_identity
+                  FROM archive_retention_tombstones
+                 WHERE source_key=? AND category='recordings'
+                   AND last_seen_at IS NOT NULL
+                """,
+                (normalized,),
+            ).fetchone()
+            if tombstone is None:
+                return None
+            cursor = conn.execute(
+                """
+                UPDATE archive_retention_tombstones
+                   SET restore_requested_at=COALESCE(restore_requested_at,?)
+                 WHERE source_key=? AND category='recordings'
+                   AND last_seen_at IS NOT NULL
+                """,
+                (utc_now(), normalized),
+            )
+        if cursor.rowcount != 1:
+            return None
+        return str(tombstone["vehicle_identity"])
+
+    def recording_restore_requested(self, source_key: str) -> bool:
+        if not isinstance(source_key, str) or not source_key:
+            return False
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT 1 FROM archive_retention_tombstones
+                 WHERE source_key=? AND category='recordings'
+                   AND restore_requested_at IS NOT NULL
+                """,
+                (source_key,),
+            ).fetchone()
+        return row is not None
+
+    def has_pending_recording_restores(self, vehicle_identity: str) -> bool:
+        identity = self._recording_job_identity(
+            vehicle_identity, "Vehicle identity"
+        )
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT 1 FROM archive_retention_tombstones
+                 WHERE category='recordings'
+                   AND vehicle_identity=?
+                   AND restore_requested_at IS NOT NULL
+                 LIMIT 1
+                """,
+                (identity,),
+            ).fetchone()
+        return row is not None
+
+    def complete_recording_restore(self, source_key: str) -> bool:
+        normalized = self._recording_job_identity(source_key, "Source key")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            tombstone = conn.execute(
+                """
+                SELECT category FROM archive_retention_tombstones
+                 WHERE source_key=? AND category='recordings'
+                   AND restore_requested_at IS NOT NULL
+                """,
+                (normalized,),
+            ).fetchone()
+            if tombstone is None:
+                return False
+            conn.execute(
+                """
+                INSERT INTO archive_retention_protections(
+                    source_key,category,protected_at
+                ) VALUES(?,?,?)
+                ON CONFLICT(source_key) DO UPDATE SET
+                    category=excluded.category,
+                    protected_at=excluded.protected_at
+                """,
+                (normalized, str(tombstone["category"]), utc_now()),
+            )
+            cursor = conn.execute(
+                "DELETE FROM archive_retention_tombstones WHERE source_key=?",
+                (normalized,),
+            )
+        return cursor.rowcount == 1
+
+    def list_retention_protected_source_keys(
+        self, category: str | None = None
+    ) -> set[str]:
+        normalized_category = category.strip() if isinstance(category, str) else ""
+        if category is not None and not isinstance(category, str):
+            raise ValueError("Protection category must be text.")
+        where = "WHERE category=?" if normalized_category else ""
+        parameters: tuple[Any, ...] = (
+            (normalized_category,) if normalized_category else ()
+        )
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT source_key FROM archive_retention_protections {where}
+                """,
+                parameters,
+            ).fetchall()
+        return {str(row["source_key"]) for row in rows}
+
+    def is_retention_protected(self, source_key: str) -> bool:
+        if not isinstance(source_key, str) or not source_key:
+            return False
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT 1 FROM archive_retention_protections WHERE source_key=?
+                """,
+                (source_key,),
+            ).fetchone()
+        return row is not None
+
+    def clear_retention_protection(self, source_key: str) -> bool:
+        normalized = self._recording_job_identity(source_key, "Source key")
+        with self.connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM archive_retention_protections WHERE source_key=?",
+                (normalized,),
+            )
+        return cursor.rowcount == 1
 
     def get_item_by_source_key(self, source_key: str) -> dict[str, Any] | None:
         with self.connect() as conn:
@@ -375,6 +1024,121 @@ class Database:
             ).fetchone()
         return dict(row) if row else None
 
+    def list_retention_candidates(
+        self, category: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Return unpinned archive rows in stable insertion order.
+
+        The engine applies recorded-at time first and falls back to local
+        insertion time when the source supplied no usable timestamp. The caller
+        remains responsible for deleting files before removing the row.
+        """
+        normalized_category = ""
+        if category is not None:
+            if not isinstance(category, str):
+                raise ValueError("Retention category must be text.")
+            normalized_category = category.strip()
+
+        clauses = [
+            "NOT EXISTS ("
+            "SELECT 1 FROM archive_retention_protections AS protection "
+            "WHERE protection.source_key=item.source_key)"
+        ]
+        if normalized_category:
+            clauses.append("item.category=?")
+        where = "WHERE " + " AND ".join(clauses)
+        parameters: tuple[Any, ...] = (
+            (normalized_category,) if normalized_category else ()
+        )
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT item.id,item.source_key,item.category,item.subtype,
+                       item.vehicle,item.filename,item.relative_path,
+                       item.media_type,item.size_bytes,item.sha256,
+                       item.source_timestamp,item.metadata_json,item.created_at
+                  FROM archive_items AS item
+                  {where}
+                 ORDER BY item.created_at ASC,item.id ASC
+                """,
+                parameters,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def delete_archive_item(self, item_id: int) -> bool:
+        """Tombstone and remove one row after caller-managed file cleanup."""
+        if isinstance(item_id, bool):
+            return False
+        try:
+            normalized_id = int(item_id)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if normalized_id <= 0:
+            return False
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            item = conn.execute(
+                """
+                SELECT item.source_key,item.category,item.vehicle,item.filename,
+                       item.subtype,item.source_timestamp,item.size_bytes,
+                       item.metadata_json
+                  FROM archive_items AS item
+                 WHERE item.id=? AND NOT EXISTS (
+                       SELECT 1 FROM archive_retention_protections AS protection
+                        WHERE protection.source_key=item.source_key
+                 )
+                """,
+                (normalized_id,),
+            ).fetchone()
+            if item is None:
+                return False
+            source_key = str(item["source_key"])
+            category = str(item["category"])
+            identity = (
+                self._recording_source_parts(source_key)[0]
+                if category == "recordings"
+                else ""
+            )
+            deleted_at = utc_now()
+            conn.execute(
+                """
+                INSERT INTO archive_retention_tombstones(
+                    source_key,category,deleted_at,vehicle_identity,vehicle,
+                    filename,subtype,source_timestamp,remote_size_bytes,
+                    item_json,last_seen_at,restore_requested_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,NULL)
+                ON CONFLICT(source_key) DO UPDATE SET
+                    category=excluded.category,
+                    deleted_at=excluded.deleted_at,
+                    vehicle_identity=excluded.vehicle_identity,
+                    vehicle=excluded.vehicle,
+                    filename=excluded.filename,
+                    subtype=excluded.subtype,
+                    source_timestamp=excluded.source_timestamp,
+                    remote_size_bytes=excluded.remote_size_bytes,
+                    item_json=excluded.item_json,
+                    last_seen_at=excluded.last_seen_at,
+                    restore_requested_at=NULL
+                """,
+                (
+                    source_key,
+                    category,
+                    deleted_at,
+                    identity,
+                    str(item["vehicle"] or ""),
+                    str(item["filename"] or "")[:255],
+                    str(item["subtype"] or "")[:40],
+                    item["source_timestamp"],
+                    max(0, int(item["size_bytes"] or 0)),
+                    self._canonical_stored_metadata(item["metadata_json"]),
+                    deleted_at,
+                ),
+            )
+            cursor = conn.execute(
+                "DELETE FROM archive_items WHERE id=?", (normalized_id,)
+            )
+        return cursor.rowcount == 1
+
     def list_items(
         self,
         *,
@@ -404,7 +1168,11 @@ class Database:
             rows = conn.execute(
                 f"""
                 SELECT id,category,subtype,vehicle,filename,relative_path,media_type,
-                       size_bytes,sha256,source_timestamp,metadata_json,created_at
+                       size_bytes,sha256,source_timestamp,metadata_json,created_at,
+                       EXISTS(
+                           SELECT 1 FROM archive_retention_protections AS protection
+                            WHERE protection.source_key=archive_items.source_key
+                       ) AS retention_protected
                   FROM archive_items
                   {where}
                  ORDER BY CASE

@@ -7,8 +7,10 @@ import os
 import re
 import secrets
 import signal
+import shutil
 import stat
 import threading
+from datetime import datetime, timezone
 from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -28,6 +30,7 @@ from .config import (
     base_url_origin,
     discovered_vehicle_changes,
     redact_settings,
+    validate_settings,
 )
 from .db import Database
 from .overdrive import OverdriveClient, OverdriveError
@@ -43,6 +46,7 @@ REQUEST_SOCKET_TIMEOUT = 30
 MAX_LOGIN_USERNAME = 128
 MAX_LOGIN_PASSWORD = 1024
 MAX_OTP_CODE_INPUT = 16
+MAX_SOURCE_KEY_LENGTH = 1000
 _MEDIA_ID = re.compile(r"^\d{1,18}$")
 _THUMBNAIL_CACHE_CONTROL = "private, max-age=300"
 
@@ -191,7 +195,7 @@ class Handler(BaseHTTPRequestHandler):
     sys_version = ""
 
     def log_message(self, fmt: str, *args) -> None:
-        path = urlparse(self.path).path
+        path = urlparse(getattr(self, "path", "")).path
         status = str(args[1]) if len(args) > 1 else "-"
         log.info("%s %s %s", self.command, path, status)
 
@@ -384,6 +388,20 @@ class Handler(BaseHTTPRequestHandler):
                 extra_headers=[("Set-Cookie", self._session_cookie("", 0))],
             )
             return
+        if path == "/api/sync/stop":
+            stopping = self.server.engine.request_stop()
+            self._json(
+                202 if stopping else 409,
+                {
+                    "stopping": stopping,
+                    "message": (
+                        "Synchronization stop requested."
+                        if stopping
+                        else "No synchronization is running."
+                    ),
+                },
+            )
+            return
         if path == "/api/sync":
             started = self.server.engine.trigger("manual")
             self._json(
@@ -397,6 +415,12 @@ class Handler(BaseHTTPRequestHandler):
                     ),
                 },
             )
+            return
+        if path == "/api/recordings/restore":
+            self._handle_recording_restore()
+            return
+        if path == "/api/recordings/release-retention":
+            self._handle_recording_retention_release()
             return
         if path == "/api/test-connection":
             self._handle_test_connection()
@@ -431,11 +455,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_api_get(self, path: str) -> None:
         if path == "/api/overview":
+            storage = self._storage_runtime()
+            stats = self.server.db.stats()
+            stats.update(storage)
             self._json(
                 200,
                 {
                     "version": __version__,
-                    "stats": self.server.db.stats(),
+                    "stats": stats,
+                    "storage": storage,
                     "sync": self.server.engine.state(),
                     "runs": self.server.db.list_runs(8),
                 },
@@ -447,6 +475,7 @@ class Handler(BaseHTTPRequestHandler):
                 "archive_root": str(self.server.archive_root),
                 "destination_support": ["local"],
                 "auth": self.server.auth.options(),
+                **self._storage_runtime(),
             }
             self._json(200, settings)
             return
@@ -467,6 +496,7 @@ class Handler(BaseHTTPRequestHandler):
                 limit = int((query.get("limit") or ["100"])[0])
             except ValueError:
                 limit = 100
+            limit = max(1, min(limit, 250))
             items = self.server.db.list_items(
                 limit=limit,
                 category=category,
@@ -474,6 +504,9 @@ class Handler(BaseHTTPRequestHandler):
                 search=search,
             )
             for item in items:
+                item["retention_protected"] = bool(
+                    item.get("retention_protected")
+                )
                 item["camera_layout"] = self._camera_layout(item)
                 item.pop("metadata_json", None)
                 item["thumbnail_url"] = (
@@ -481,6 +514,18 @@ class Handler(BaseHTTPRequestHandler):
                     if self._thumbnail_path(item) is not None
                     else None
                 )
+            if category in {"", "recordings"}:
+                deleted = self.server.db.list_deleted_recordings(
+                    category="recordings",
+                    subtype=subtype,
+                    search=search,
+                    limit=limit,
+                )
+                items.extend(
+                    self._deleted_recording_placeholder(item) for item in deleted
+                )
+            items.sort(key=self._archive_item_sort_key, reverse=True)
+            items = items[:limit]
             self._json(
                 200,
                 {
@@ -490,6 +535,70 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
         self._json(404, {"error": "Not found."})
+
+    @staticmethod
+    def _archive_item_sort_key(item: dict[str, Any]) -> tuple[int, str]:
+        try:
+            timestamp = int(item.get("source_timestamp") or 0)
+        except (TypeError, ValueError, OverflowError):
+            timestamp = 0
+        if 0 < timestamp < 10_000_000_000:
+            timestamp *= 1000
+        if timestamp <= 0:
+            raw = str(item.get("created_at") or item.get("deleted_at") or "")
+            try:
+                parsed = datetime.fromisoformat(raw)
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                timestamp = int(parsed.timestamp() * 1000)
+            except (OSError, OverflowError, ValueError):
+                timestamp = 0
+        return timestamp, str(item.get("filename") or "")
+
+    @staticmethod
+    def _deleted_recording_placeholder(item: dict[str, Any]) -> dict[str, Any]:
+        """Expose only the metadata needed to identify and restore a deleted clip."""
+        deleted_at = str(item.get("deleted_at") or "")
+        restore_requested_at = str(item.get("restore_requested_at") or "")
+        return {
+            "id": None,
+            "category": "recordings",
+            "subtype": str(item.get("subtype") or "")[:40],
+            "vehicle": str(item.get("vehicle") or ""),
+            "filename": str(item.get("filename") or ""),
+            "source_timestamp": item.get("source_timestamp"),
+            "created_at": deleted_at,
+            "deleted_at": deleted_at,
+            "last_seen_at": str(item.get("last_seen_at") or ""),
+            "restore_requested_at": restore_requested_at,
+            "restore_requested": bool(restore_requested_at),
+            "source_key": str(item.get("source_key") or ""),
+            "deleted_local": True,
+            "size_bytes": 0,
+            "remote_size_bytes": max(
+                0, int(item.get("remote_size_bytes") or 0)
+            ),
+            "retention_protected": False,
+            "media_type": "",
+            "camera_layout": None,
+            "thumbnail_url": None,
+            "media_url": None,
+        }
+
+    def _storage_runtime(self) -> dict[str, int]:
+        try:
+            usage = shutil.disk_usage(self.server.archive_root)
+        except OSError:
+            return {
+                "storage_capacity_bytes": 0,
+                "storage_free_bytes": 0,
+                "storage_used_bytes": 0,
+            }
+        return {
+            "storage_capacity_bytes": max(0, int(usage.total)),
+            "storage_free_bytes": max(0, int(usage.free)),
+            "storage_used_bytes": max(0, int(usage.used)),
+        }
 
     def _handle_login(self) -> None:
         payload = self._read_json()
@@ -614,15 +723,87 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if isinstance(vehicle, dict):
                 _apply_vehicle_token_policy(vehicle, current["vehicle"])
+            normalized = validate_settings(payload, current)
+            storage_limit = normalized["retention"]["storage_limit"]
+            capacity = self._storage_runtime()["storage_capacity_bytes"]
+            if (
+                storage_limit["enabled"]
+                and capacity > 0
+                and storage_limit["max_bytes"] > capacity
+            ):
+                raise SettingsError(
+                    "Storage limit cannot exceed the archive filesystem capacity."
+                )
             saved = self.server.db.save_settings(payload)
         except SettingsError as exc:
             self._json(400, {"error": str(exc)})
             return
+        retention_result = self.server.engine.apply_retention(saved)
         self._json(
             200,
             {
                 "success": True,
                 "settings": redact_settings(saved),
+                "retention": retention_result,
+            },
+        )
+
+    def _handle_recording_restore(self) -> None:
+        payload = self._read_json()
+        source_key = payload.get("source_key") if isinstance(payload, dict) else None
+        if (
+            not isinstance(source_key, str)
+            or not source_key.strip()
+            or len(source_key.strip()) > MAX_SOURCE_KEY_LENGTH
+            or any(ord(character) < 32 for character in source_key)
+        ):
+            self._json(400, {"error": "A valid source_key is required."})
+            return
+        source_key = source_key.strip()
+        try:
+            restore_identity = self.server.db.request_recording_restore(source_key)
+        except ValueError:
+            self._json(400, {"error": "A valid source_key is required."})
+            return
+        if not restore_identity:
+            self._json(404, {"error": "Deleted recording not found."})
+            return
+        current_identity = self.server.engine.configured_vehicle_identity()
+        sync_started = bool(
+            restore_identity == current_identity
+            and self.server.engine.trigger("restore")
+        )
+        self._json(
+            202,
+            {
+                "queued": True,
+                "sync_started": sync_started,
+            },
+        )
+
+    def _handle_recording_retention_release(self) -> None:
+        payload = self._read_json()
+        item_id = payload.get("item_id") if isinstance(payload, dict) else None
+        if isinstance(item_id, bool) or not isinstance(item_id, int) or item_id <= 0:
+            self._json(400, {"error": "A valid item_id is required."})
+            return
+        item = self.server.db.get_item(item_id)
+        if not item or item.get("category") != "recordings":
+            self._json(404, {"error": "Archived recording not found."})
+            return
+        source_key = str(item.get("source_key") or "")
+        if not self.server.db.clear_retention_protection(source_key):
+            self._json(409, {"error": "Recording is not protected from retention."})
+            return
+        retention = self.server.engine.apply_retention(
+            self.server.db.get_settings()
+        )
+        self._json(
+            200,
+            {
+                "released": True,
+                "item_deleted": self.server.db.get_item(item_id) is None,
+                "retention": retention,
             },
         )
 

@@ -32,6 +32,8 @@ dependencies.
 - Storage configured at both deployment and application levels.
 - Manual, interval, and daily synchronization.
 - Optional `Wi-Fi only` policy and SSID allowlist.
+- Fixed recording queues with resumable `.part` downloads, byte-weighted
+  progress, three-level priority, and an explicit Stop action.
 - Configurable recording types and surveillance severity.
 - Visual media library with authenticated thumbnails and HTTP Range streaming.
 - In-player views for all cameras or one enlarged camera, without modifying the
@@ -43,6 +45,8 @@ dependencies.
 - Optional Telegram and WhatsApp one-time-code login.
 - Persistent, revocable sessions and brute-force protection.
 - SQLite inventory, run history, SHA-256 checksums, and deduplication.
+- Optional local retention by category, protected latest items, and a global
+  archive-size limit based on the mounted filesystem capacity.
 - Selectable English and Brazilian Portuguese interface.
 - No project analytics and no maintainer-operated cloud service.
 
@@ -180,8 +184,9 @@ After signing in:
 4. Enter the 8-character access code, full device token, or an existing bearer
    JWT.
 5. Select the schedule, network policy, data categories, and destination.
-6. Choose **Save & test connection**.
-7. Start the first synchronization.
+6. Optionally configure local retention and a storage limit.
+7. Choose **Save & test connection**.
+8. Start the first synchronization.
 
 ## Where files are stored
 
@@ -212,11 +217,10 @@ numeric identity, set `ARCHIVE_UID` and `ARCHIVE_GID` in `.env`. The included
 one-shot initializer validates access before the application starts and prints
 an actionable error if the share is not writable.
 
-Overdrive Archive does not currently delete old archive data or enforce a total
-archive quota. `ARCHIVE_MAX_RECORDING_GB` limits one incoming recording, not the
-whole library. Monitor free space on both `ARCHIVE_DATA_PATH` and
-`ARCHIVE_HOST_PATH`, and use filesystem snapshots or external retention tooling
-until application retention policies are implemented.
+`ARCHIVE_MAX_RECORDING_GB` limits one incoming recording; it is separate from
+the optional total archive limit configured in the web application. With the
+application limit disabled, the archive may use the whole available mounted
+filesystem.
 
 ### 2. Web settings: choose the archive subdirectory
 
@@ -274,11 +278,9 @@ private asset.
 
 ## Interface language
 
-The web interface supports English and Português (Brasil). English is the
-source and fallback language for a new installation. Choose another language
-under **Settings → Interface**. The authenticated preference is stored in the
-Archive installation and cached by the browser; a new browser starts the login
-screen in English until it has cached a preference. This does not change the
+The web interface supports English and Português (Brasil). Choose the interface
+language under **Settings → Interface**. The authenticated preference is stored
+in the Archive installation and cached by the browser. This does not change the
 language configured inside the vehicle.
 
 ## Camera views
@@ -436,6 +438,12 @@ downloads. The same policy applies to scheduled and manually started runs. In a
 server-side pull model this is best-effort; a future vehicle-side push agent can
 enforce it continuously.
 
+Collection, recording-selection, and network settings are snapshotted when a
+run starts. Changing **Wi-Fi only** while a run is active applies to the next
+run; use **Stop synchronization** on the active row in **Synchronization runs**
+to stop the current run safely. Local retention is separate: the current saved
+retention rules are applied after the run finishes.
+
 ## Recording selection
 
 Recording types:
@@ -446,11 +454,16 @@ Recording types:
 - proximity;
 - OEM dashcam.
 
-Surveillance filters:
+Overdrive-reported severity filters apply to Surveillance and Proximity clips:
 
-- `NOTICE`;
-- `ALERT`;
-- `CRITICAL`.
+- `NOTICE`: background, passing, unknown/animal, or static non-person activity;
+- `ALERT`: nearby people or approaching vehicle/bicycle activity;
+- `CRITICAL`: the closest or strongest threat reported by Overdrive, commonly a
+  very-close person.
+
+The archive does not calculate or change these labels. With no severity selected,
+the severity filter is disabled. A recording without `peakSeverity` is retained
+rather than silently discarded.
 
 Replay compatibility follows both upstream generations:
 
@@ -478,13 +491,30 @@ to Overdrive PRs #150 and #152.
 
 Recordings are:
 
-1. streamed to a `.part` file;
-2. limited by a configurable maximum size;
-3. checked against the expected Overdrive size when available;
-4. hashed with SHA-256;
-5. flushed to disk;
-6. atomically renamed;
-7. added to the SQLite inventory.
+1. placed in a fixed queue that does not grow until the next synchronization;
+2. prioritized as validated `.part` downloads, older backlog, then newly
+   discovered files;
+3. streamed to a deterministic `.part` file and resumed with validated HTTP
+   Range metadata when supported by the vehicle;
+4. limited by a configurable maximum size;
+5. checked against the expected Overdrive size when available;
+6. hashed with SHA-256;
+7. flushed to disk;
+8. atomically renamed;
+9. added to the SQLite inventory.
+
+Queue progress is weighted by expected bytes, not file count. A 1 GiB partial
+inside a 10 GiB known-size queue therefore reports 10%. If any queued item has
+no declared size, the interface shows indeterminate progress instead of an
+invented percentage. A stopped run keeps a validated `.part` for the next run
+and never starts a second synchronization behind the first one.
+
+Recording identity uses the vehicle identity, filename, and source timestamp.
+A missing local file or an expected-size mismatch is downloaded again. If a
+vehicle silently replaces a recording while keeping the same filename,
+timestamp, and byte size and exposes no checksum, that change cannot be
+distinguished without downloading the entire file again; this limitation is
+reported rather than hidden.
 
 Example:
 
@@ -509,6 +539,44 @@ archive/
         ├── roadsense/
         └── configuration/
 ```
+
+The **Archive library** opens with the **Recordings** category selected so video
+is not mixed with configuration, telemetry, or other JSON snapshots. **All
+categories** remains available when an operator explicitly selects it.
+
+## Local retention and storage limit
+
+Retention is disabled by default. In **Settings → Local retention**, each
+archive category can independently delete local copies older than a number of
+minutes, hours, or days. Age uses the original source timestamp when available
+and falls back to the local archive time. **Keep the latest X items** protects
+that category's newest items even when they are older than the configured age.
+Saving settings applies enabled retention rules immediately to local files.
+
+The optional storage limit uses the mounted archive filesystem capacity as the
+largest value offered by the interface. When the archive is over its configured
+limit, unprotected local items are removed from oldest to newest. If protected
+or unmanaged files alone exceed the limit, the application reports that the
+limit could not be reached and does not break the protection promise.
+
+Retention deletes the primary local file and known local sidecars such as the
+thumbnail, metadata, event timeline, and resumable partial. It then keeps a
+zero-byte **Deleted locally** database placeholder while a complete recording
+listing still reports the original on the vehicle. The placeholder prevents an
+automatic redownload, shows the remote file size separately, and offers
+**Download again**.
+
+Restoring a recording bypasses the current type, severity, and age filters but
+still follows the configured network policy. A restored file is manually
+protected from retention so the same rule cannot immediately remove it again.
+The archived card offers **Use retention rules** to remove that protection; the
+current rules may then delete the local copy immediately.
+
+A placeholder disappears only after a complete, internally consistent vehicle
+listing confirms that the original is gone. Timeouts, incomplete pages,
+cancelled runs, and other partial listings never purge it. Retention never calls
+a vehicle deletion endpoint and never removes or changes a recording stored in
+the car.
 
 ## Privacy and security
 
@@ -636,7 +704,8 @@ synthetic data is allowed in tests and documentation.
 - [ ] SFTP destination.
 - [ ] WebDAV destination.
 - [ ] S3-compatible destination.
-- [ ] Retention policies.
+- [x] Per-category retention, keep-latest protection, and filesystem-aware
+  storage limits.
 - [ ] Notification hooks for failed runs.
 - [ ] Multiple vehicles.
 - [ ] Vehicle-side push agent with strict Wi-Fi enforcement and resumable

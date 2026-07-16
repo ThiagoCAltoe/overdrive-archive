@@ -4,7 +4,9 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import ssl
+import stat
 from pathlib import Path
 from typing import Any, Callable, Iterator
 from urllib.error import HTTPError, URLError
@@ -24,6 +26,7 @@ class OverdriveError(RuntimeError):
 _JWT_RE = re.compile(
     r"^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$"
 )
+_CONTENT_RANGE_RE = re.compile(r"^bytes (\d+)-(\d+)/(\d+)$")
 
 
 def is_bearer_jwt(value: str) -> bool:
@@ -99,6 +102,7 @@ class OverdriveClient:
         method: str = "GET",
         json_body: dict[str, Any] | None = None,
         authenticated: bool = True,
+        request_headers: dict[str, str] | None = None,
     ):
         data = None
         headers = {
@@ -113,6 +117,10 @@ class OverdriveClient:
             if not self.jwt:
                 self.authenticate()
             headers["Authorization"] = f"Bearer {self.jwt}"
+        for header in ("Range", "If-Range"):
+            value = str((request_headers or {}).get(header) or "").strip()
+            if value:
+                headers[header] = value
         request = Request(
             self._url(path),
             data=data,
@@ -259,11 +267,13 @@ class OverdriveClient:
         recording_types: list[str],
         severities: list[str],
     ) -> Iterator[dict[str, Any]]:
-        page = 1
-        while page <= 1000:
+        page_size = 200
+        listing_total: int | None = None
+        emitted = 0
+        for page in range(1, 1001):
             params: dict[str, Any] = {
                 "page": page,
-                "pageSize": 200,
+                "pageSize": page_size,
             }
             if recording_types:
                 params["type"] = ",".join(recording_types)
@@ -277,13 +287,54 @@ class OverdriveClient:
             recordings = payload.get("recordings")
             if not isinstance(recordings, list):
                 raise OverdriveError("Recordings API returned an unexpected response.")
+            try:
+                total_count = int(payload["totalCount"])
+                total_pages = int(payload["totalPages"])
+                response_page = int(payload["page"])
+                response_page_size = int(payload["pageSize"])
+            except (KeyError, TypeError, ValueError, OverflowError) as exc:
+                raise OverdriveError(
+                    "Recordings API returned invalid pagination metadata."
+                ) from exc
+            expected_pages = max(1, (total_count + page_size - 1) // page_size)
+            if (
+                total_count < 0
+                or total_pages != expected_pages
+                or total_pages > 1000
+                or response_page != page
+                or response_page_size != page_size
+            ):
+                raise OverdriveError(
+                    "Recordings API returned inconsistent pagination metadata."
+                )
+            if listing_total is None:
+                listing_total = total_count
+            elif listing_total != total_count:
+                raise OverdriveError(
+                    "The recording listing changed while it was being read."
+                )
+            expected_items = min(
+                page_size,
+                max(0, total_count - (page - 1) * page_size),
+            )
+            if len(recordings) != expected_items or not all(
+                isinstance(item, dict) for item in recordings
+            ):
+                raise OverdriveError(
+                    "Recordings API returned an incomplete page."
+                )
             for item in recordings:
-                if isinstance(item, dict):
-                    yield item
-            total_pages = max(1, int(payload.get("totalPages") or 1))
-            if page >= total_pages or len(recordings) < 200:
-                break
-            page += 1
+                emitted += 1
+                yield item
+            if page >= total_pages:
+                if emitted != total_count:
+                    raise OverdriveError(
+                        "Recordings API returned an incomplete listing."
+                    )
+                return
+        raise OverdriveError(
+            "The recording listing exceeded the safe pagination limit."
+        )
 
     def fetch_paginated(
         self,
@@ -324,34 +375,373 @@ class OverdriveClient:
         *,
         max_bytes: int,
         policy_check: Callable[[], None] | None = None,
+        resume: bool = False,
+        source_identity: str = "",
+        expected_size: int = 0,
+        progress_callback: Callable[[int, int], None] | None = None,
     ) -> tuple[int, str]:
-        digest = hashlib.sha256()
-        written = 0
-        since_check = 0
+        """Download a file, optionally resuming a validated deterministic part.
+
+        Resume data is accepted only when its sidecar matches the source and the
+        server supplies a stable ETag or Last-Modified validator.  A server that
+        ignores Range safely restarts the transfer from byte zero.
+        """
+        expected = max(0, int(expected_size))
+        identity = str(source_identity or path)
+        metadata_path = self._partial_metadata_path(destination)
+        existing = 0
+        metadata: dict[str, Any] | None = None
+
+        if resume:
+            metadata = self._load_partial_metadata(
+                destination,
+                source_identity=identity,
+                expected_size=expected,
+            )
+            existing = self.resumable_size(
+                destination,
+                source_identity=identity,
+                expected_size=expected,
+            )
+            if destination.exists() and not existing:
+                self._discard_partial(destination)
+                metadata = None
+        elif destination.exists() or metadata_path.exists():
+            raise OverdriveError("Could not create a private temporary download file.")
+
+        if existing > max_bytes:
+            self._discard_partial(destination)
+            raise OverdriveError("Recording exceeded the configured size limit.")
+        if expected and existing == expected:
+            if policy_check:
+                policy_check()
+            size, digest_hex = self._hash_download(destination, policy_check)
+            if progress_callback:
+                progress_callback(size, expected)
+            return size, digest_hex
+
+        request_headers: dict[str, str] = {}
+        if existing and metadata is not None:
+            request_headers["Range"] = f"bytes={existing}-"
+            request_headers["If-Range"] = str(metadata["validator_value"])
+        if policy_check:
+            policy_check()
+
+        response = (
+            self._open(path, request_headers=request_headers)
+            if request_headers
+            else self._open(path)
+        )
+        with response:
+            status = self._response_status(response)
+            headers = self._response_headers(response)
+            content_length = self._header_int(headers, "content-length")
+            target_total = expected
+            append = False
+
+            if existing and status == 206:
+                if metadata is None:
+                    self._discard_partial(destination)
+                    raise OverdriveError(
+                        "Resumable recording metadata is unavailable."
+                    )
+                parsed_range = self._parse_content_range(headers.get("content-range", ""))
+                if (
+                    parsed_range is None
+                    or parsed_range[0] != existing
+                    or parsed_range[1] < parsed_range[0]
+                    or parsed_range[2] != int(metadata["total_size"])
+                    or (expected and parsed_range[2] != expected)
+                    or not self._validator_matches(metadata, headers)
+                ):
+                    self._discard_partial(destination)
+                    raise OverdriveError("Vehicle returned an invalid resumed recording range.")
+                declared = parsed_range[1] - parsed_range[0] + 1
+                if content_length is not None and content_length != declared:
+                    self._discard_partial(destination)
+                    raise OverdriveError("Vehicle returned an inconsistent resumed recording size.")
+                target_total = parsed_range[2]
+                if target_total > max_bytes:
+                    raise OverdriveError("Recording exceeded the configured size limit.")
+                append = True
+            elif existing:
+                # If-Range deliberately permits a full 200 response when the
+                # remote object changed.  Discard the stale prefix and restart.
+                self._discard_partial(destination)
+                existing = 0
+                metadata = None
+
+            if not append:
+                if status not in (200, 206):
+                    raise OverdriveError("Vehicle returned an unexpected download response.")
+                if status == 206:
+                    parsed_range = self._parse_content_range(headers.get("content-range", ""))
+                    if parsed_range is None or parsed_range[0] != 0:
+                        raise OverdriveError("Vehicle returned an invalid recording range.")
+                    target_total = parsed_range[2]
+                elif not target_total and content_length is not None:
+                    target_total = content_length
+                if expected and content_length is not None and content_length != expected:
+                    raise OverdriveError(
+                        "Vehicle reported a recording size that differs from its index."
+                    )
+                if target_total > max_bytes:
+                    raise OverdriveError("Recording exceeded the configured size limit.")
+
+                validator = self._select_validator(headers)
+                if resume and validator and target_total:
+                    self._write_partial_metadata(
+                        metadata_path,
+                        source_identity=identity,
+                        expected_size=expected,
+                        total_size=target_total,
+                        validator=validator,
+                    )
+
+            digest = hashlib.sha256()
+            if append:
+                self._hash_download(destination, policy_check, digest=digest)
+                flags = os.O_WRONLY | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+            else:
+                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                flags |= getattr(os, "O_NOFOLLOW", 0)
+
+            try:
+                descriptor = os.open(destination, flags, 0o600)
+            except OSError as exc:
+                raise OverdriveError(
+                    "Could not create a private temporary download file."
+                ) from exc
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode) or (append and info.st_size != existing):
+                os.close(descriptor)
+                raise OverdriveError("Resumable download file changed during transfer.")
+
+            written = existing
+            try:
+                mode = "ab" if append else "wb"
+                with os.fdopen(descriptor, mode) as handle:
+                    if progress_callback:
+                        progress_callback(written, target_total)
+                    while True:
+                        if policy_check:
+                            policy_check()
+                        chunk = response.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        written += len(chunk)
+                        if written > max_bytes or (target_total and written > target_total):
+                            raise OverdriveError(
+                                "Recording exceeded the configured size limit."
+                            )
+                        handle.write(chunk)
+                        digest.update(chunk)
+                        if progress_callback:
+                            progress_callback(written, target_total)
+                    if policy_check:
+                        policy_check()
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            except Exception:
+                # A valid prefix is intentionally retained for policy pauses,
+                # explicit cancellation, timeouts, and other interrupted reads.
+                raise
+
+        if target_total and written != target_total:
+            raise OverdriveError(
+                f"Recording transfer ended at {written} of {target_total} bytes."
+            )
+        return written, digest.hexdigest()
+
+    @staticmethod
+    def _partial_metadata_path(destination: Path) -> Path:
+        return destination.with_name(destination.name + ".meta")
+
+    @classmethod
+    def _discard_partial(cls, destination: Path) -> None:
+        for path in (destination, cls._partial_metadata_path(destination)):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    @classmethod
+    def discard_resume_metadata(cls, destination: Path) -> None:
+        try:
+            cls._partial_metadata_path(destination).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    @classmethod
+    def _load_partial_metadata(
+        cls,
+        destination: Path,
+        *,
+        source_identity: str,
+        expected_size: int,
+    ) -> dict[str, Any] | None:
+        metadata_path = cls._partial_metadata_path(destination)
+        try:
+            info = metadata_path.lstat()
+            if not stat.S_ISREG(info.st_mode) or info.st_size > 64 * 1024:
+                return None
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(metadata_path, flags)
+            with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        if (
+            payload.get("source_identity") != source_identity
+            or payload.get("expected_size") != expected_size
+            or payload.get("validator_header") not in {"etag", "last-modified"}
+            or not isinstance(payload.get("validator_value"), str)
+            or not payload.get("validator_value")
+            or not isinstance(payload.get("total_size"), int)
+            or int(payload["total_size"]) <= 0
+        ):
+            return None
+        if expected_size and int(payload["total_size"]) != expected_size:
+            return None
+        return payload
+
+    @classmethod
+    def resumable_size(
+        cls,
+        destination: Path,
+        *,
+        source_identity: str,
+        expected_size: int,
+    ) -> int:
+        metadata = cls._load_partial_metadata(
+            destination,
+            source_identity=source_identity,
+            expected_size=max(0, int(expected_size)),
+        )
+        if metadata is None:
+            return 0
+        try:
+            info = destination.lstat()
+        except OSError:
+            return 0
+        if not stat.S_ISREG(info.st_mode):
+            return 0
+        size = max(0, int(info.st_size))
+        return size if size <= int(metadata["total_size"]) else 0
+
+    @staticmethod
+    def _response_status(response: Any) -> int:
+        status = getattr(response, "status", None)
+        if status is None:
+            getcode = getattr(response, "getcode", None)
+            status = getcode() if callable(getcode) else None
+        return int(status or 200)
+
+    @staticmethod
+    def _response_headers(response: Any) -> dict[str, str]:
+        source = getattr(response, "headers", None)
+        if source is None:
+            return {}
+        items = source.items() if hasattr(source, "items") else []
+        return {str(key).lower(): str(value).strip() for key, value in items}
+
+    @staticmethod
+    def _header_int(headers: dict[str, str], key: str) -> int | None:
+        value = headers.get(key)
+        if value is None:
+            return None
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError) as exc:
+            raise OverdriveError("Vehicle returned an invalid download size.") from exc
+        if parsed < 0:
+            raise OverdriveError("Vehicle returned an invalid download size.")
+        return parsed
+
+    @staticmethod
+    def _parse_content_range(value: str) -> tuple[int, int, int] | None:
+        match = _CONTENT_RANGE_RE.fullmatch(value.strip())
+        if not match:
+            return None
+        return tuple(int(part) for part in match.groups())  # type: ignore[return-value]
+
+    @staticmethod
+    def _select_validator(headers: dict[str, str]) -> tuple[str, str] | None:
+        etag = headers.get("etag", "").strip()
+        if etag and not etag.startswith("W/"):
+            return "etag", etag
+        modified = headers.get("last-modified", "").strip()
+        return ("last-modified", modified) if modified else None
+
+    @staticmethod
+    def _validator_matches(metadata: dict[str, Any], headers: dict[str, str]) -> bool:
+        key = str(metadata.get("validator_header") or "")
+        return bool(key and headers.get(key) == metadata.get("validator_value"))
+
+    @staticmethod
+    def _write_partial_metadata(
+        metadata_path: Path,
+        *,
+        source_identity: str,
+        expected_size: int,
+        total_size: int,
+        validator: tuple[str, str],
+    ) -> None:
+        payload = json.dumps(
+            {
+                "source_identity": source_identity,
+                "expected_size": expected_size,
+                "total_size": total_size,
+                "validator_header": validator[0],
+                "validator_value": validator[1],
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        temporary = metadata_path.with_name(
+            f".{metadata_path.name}.{secrets.token_hex(8)}.tmp"
+        )
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
         try:
-            descriptor = os.open(destination, flags, 0o600)
+            descriptor = os.open(temporary, flags, 0o600)
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, metadata_path)
         except OSError as exc:
-            raise OverdriveError(
-                "Could not create a private temporary download file."
-            ) from exc
-        with os.fdopen(descriptor, "wb") as handle, self._open(path) as response:
+            raise OverdriveError("Could not store resumable download metadata.") from exc
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    @staticmethod
+    def _hash_download(
+        path: Path,
+        policy_check: Callable[[], None] | None,
+        *,
+        digest: Any | None = None,
+    ) -> tuple[int, str]:
+        digest = digest or hashlib.sha256()
+        size = 0
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(path, flags)
+        except OSError as exc:
+            raise OverdriveError("Could not read the resumable download file.") from exc
+        with os.fdopen(descriptor, "rb") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                raise OverdriveError("Resumable download path is not a regular file.")
             while True:
-                chunk = response.read(1024 * 1024)
+                if policy_check:
+                    policy_check()
+                chunk = handle.read(1024 * 1024)
                 if not chunk:
                     break
-                written += len(chunk)
-                since_check += len(chunk)
-                if written > max_bytes:
-                    raise OverdriveError("Recording exceeded the configured size limit.")
-                handle.write(chunk)
+                size += len(chunk)
                 digest.update(chunk)
-                if policy_check and since_check >= 8 * 1024 * 1024:
-                    policy_check()
-                    since_check = 0
-            handle.flush()
-            os.fsync(handle.fileno())
-        return written, digest.hexdigest()
+        return size, digest.hexdigest()
 
     @staticmethod
     def encoded_filename(filename: str) -> str:

@@ -34,6 +34,9 @@ class _Database:
     def recording_subtypes(self) -> list[dict]:
         return []
 
+    def list_deleted_recordings(self, **_filters) -> list[dict]:
+        return []
+
 
 class ThumbnailServerTests(unittest.TestCase):
     def setUp(self) -> None:

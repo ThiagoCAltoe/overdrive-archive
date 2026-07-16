@@ -4,8 +4,8 @@
 | --- | --- | --- | --- |
 | ACC / drive recordings | `/api/recordings` → `normal` | Yes | Archived under the `drive` subtype. |
 | Instant replays | `/api/recordings` → `replay` or legacy `normal` | Yes | Supports both PR #150 and PR #152 classifications. |
-| Surveillance recordings | `/api/recordings` → `sentry` | Yes | Supports Notice, Alert, and Critical filters. |
-| Proximity recordings | `/api/recordings` → `proximity` | Yes | Optional recording type. |
+| Surveillance recordings | `/api/recordings` → `sentry` | Yes | Filters Overdrive-reported Notice, Alert, and Critical peak severity. |
+| Proximity recordings | `/api/recordings` → `proximity` | Yes | Uses the same optional severity filter as Surveillance. |
 | OEM dashcam recordings | `/api/recordings` → `oemDashcam` | Yes | Optional recording type. |
 | Trips | `/api/trips` | Yes | Paginated summary snapshots. |
 | Trip telemetry | `/api/trips/{id}/telemetry` | Yes | Archived once per completed trip. |
@@ -18,6 +18,12 @@
 
 Unsupported endpoints are reported as partial sync errors rather than silently
 disabling the whole run.
+
+Severity is not reclassified by the archive. Notice generally represents
+background, passing, unknown/animal, or static non-person activity; Alert covers
+nearby people or approaching vehicles/bicycles; Critical is the closest or
+strongest threat reported by Overdrive. With no severity selected, filtering is
+disabled, and recordings without `peakSeverity` remain eligible.
 
 “Yes” means that the connector and archive format are implemented and covered
 by synthetic tests. It does not mean that every endpoint has been validated on
@@ -81,6 +87,14 @@ normalized for compatibility with future or third-party collectors.
 
 This ordering applies only to the Overdrive Archive web library. It does not
 change the order shown by Overdrive inside the vehicle.
+
+## Recording identity and refreshes
+
+The archive identifies a recording by vehicle, filename, and source timestamp.
+It downloads a missing local file again and repairs a file whose size differs
+from the size advertised by Overdrive. The recording API does not consistently
+provide a content checksum, so a silent replacement that preserves the same
+filename, timestamp, and size cannot be detected without a full redownload.
 
 ## Camera views in the archive player
 

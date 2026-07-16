@@ -7,6 +7,7 @@ import os
 import re
 import secrets
 import shutil
+import stat
 import subprocess
 import threading
 import time
@@ -93,12 +94,51 @@ class PolicyPause(OverdriveError):
     """Raised when a configurable network policy asks the run to stop."""
 
 
+class SyncCancelled(Exception):
+    """Raised at a safe checkpoint after the operator requests Stop."""
+
+
 @dataclass
 class RunTotals:
     items_added: int = 0
     items_skipped: int = 0
     error_count: int = 0
     bytes_added: int = 0
+
+
+@dataclass(frozen=True)
+class RecordingQueueEntry:
+    item: dict[str, Any]
+    source_key: str
+    filename: str
+    subtype: str
+    timestamp_ms: int
+    expected_size: int
+    relative: Path
+    final_path: Path
+    partial_path: Path
+    existing: dict[str, Any] | None
+    needs_download: bool
+    partial_size: int
+    known_before_run: bool
+
+
+def recording_queue_priority(entry: RecordingQueueEntry) -> tuple[int, int, int, str]:
+    """Match the dashboard queue: partials, prior backlog, then new items."""
+    timestamp = entry.timestamp_ms if entry.timestamp_ms > 0 else 2**63 - 1
+    if entry.partial_size > 0:
+        remaining = (
+            max(0, entry.expected_size - entry.partial_size)
+            if entry.expected_size
+            else 2**63 - 1
+        )
+        return (0, remaining, timestamp, entry.filename)
+    return (
+        1 if entry.known_before_run else 2,
+        timestamp,
+        0,
+        entry.filename,
+    )
 
 
 def _filename_subtype(filename: str) -> str:
@@ -218,6 +258,11 @@ class SyncEngine:
         self._current: dict[str, Any] = {}
         self._scheduler_stop = threading.Event()
         self._scheduler_thread: threading.Thread | None = None
+        self._cancel_event: threading.Event | None = None
+        self._sync_thread: threading.Thread | None = None
+        self._retention_lock = threading.Lock()
+        self._retention_active = False
+        self._last_retention_check = 0.0
 
     def start_scheduler(self) -> None:
         if self._scheduler_thread and self._scheduler_thread.is_alive():
@@ -231,26 +276,71 @@ class SyncEngine:
 
     def stop(self) -> None:
         self._scheduler_stop.set()
+        self.request_stop()
+
+    def request_stop(self) -> bool:
+        """Request cooperative cancellation without freeing the active slot."""
+        with self._state_lock:
+            if not self._active or self._cancel_event is None:
+                return False
+            self._cancel_event.set()
+            self._current.update(
+                {
+                    "stop_requested": True,
+                    "stage": "stopping",
+                    "current": "Stopping synchronization…",
+                }
+            )
+            return True
+
+    def _check_cancelled(self) -> None:
+        with self._state_lock:
+            event = self._cancel_event
+        if event is not None and event.is_set():
+            raise SyncCancelled("Synchronization stopped by user.")
 
     def trigger(self, reason: str = "manual") -> bool:
+        cancel_event = threading.Event()
         with self._state_lock:
-            if self._active:
+            if self._active or self._retention_active:
                 return False
             self._active = True
+            self._cancel_event = cancel_event
             self._current = {
                 "active": True,
                 "reason": reason,
                 "stage": "queued",
                 "current": "",
                 "started_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "stop_requested": False,
+                "run_id": None,
+                "queue_bytes_done": 0,
+                "queue_bytes_total": 0,
+                "queue_items_done": 0,
+                "queue_items_total": 0,
+                "queue_unknown_sizes": 0,
+                "queue_bytes_indeterminate": False,
             }
         thread = threading.Thread(
             target=self._thread_run,
-            args=(reason,),
+            args=(reason, cancel_event),
             name=f"archive-sync-{reason}",
             daemon=True,
         )
-        thread.start()
+        with self._state_lock:
+            self._sync_thread = thread
+        try:
+            thread.start()
+        except Exception:
+            with self._state_lock:
+                if self._cancel_event is cancel_event:
+                    self._active = False
+                    self._cancel_event = None
+                    self._sync_thread = None
+                    self._current.update(
+                        {"active": False, "stage": "idle", "current": ""}
+                    )
+            raise
         return True
 
     def state(self) -> dict[str, Any]:
@@ -268,17 +358,21 @@ class SyncEngine:
         with self._state_lock:
             self._current.update(changes)
 
-    def _thread_run(self, reason: str) -> None:
+    def _thread_run(self, reason: str, cancel_event: threading.Event) -> None:
         try:
             self.run_once(reason)
         except Exception:
             log.exception("Unexpected sync failure")
         finally:
             with self._state_lock:
-                self._active = False
-                self._current["active"] = False
-                self._current["stage"] = "idle"
-                self._current["current"] = ""
+                if self._cancel_event is cancel_event:
+                    self._active = False
+                    self._cancel_event = None
+                    self._sync_thread = None
+                    self._current["active"] = False
+                    self._current["stop_requested"] = False
+                    self._current["stage"] = "idle"
+                    self._current["current"] = ""
 
     def _scheduler_loop(self) -> None:
         while not self._scheduler_stop.wait(15):
@@ -287,6 +381,11 @@ class SyncEngine:
                 due = self._next_run_at(settings)
                 if due is not None and due <= datetime.now(timezone.utc):
                     self.trigger("schedule")
+                now = time.monotonic()
+                if now - self._last_retention_check >= 60:
+                    result = self.apply_retention(settings)
+                    if result.get("status") != "deferred":
+                        self._last_retention_check = now
             except Exception:
                 log.exception("Scheduler check failed")
 
@@ -353,6 +452,7 @@ class SyncEngine:
 
     def run_once(self, reason: str = "manual") -> dict[str, Any]:
         run_id = self.db.start_run(reason)
+        self._set_state(run_id=run_id)
         totals = RunTotals()
         errors: list[str] = []
         network_type = "unknown"
@@ -361,7 +461,9 @@ class SyncEngine:
         self._set_state(stage="connecting", current="Authenticating with Overdrive")
 
         try:
+            self._check_cancelled()
             status_payload = client.status()
+            self._check_cancelled()
             status_device_id = str(status_payload.get("deviceId") or "").strip()
             if status_device_id and status_device_id != "unknown":
                 settings["vehicle"]["device_id"] = status_device_id
@@ -381,6 +483,7 @@ class SyncEngine:
             network_type = str(network.get("type") or "unknown")
             allowed, policy_message = wifi_policy(settings, network)
             if not allowed:
+                self._check_cancelled()
                 self.db.finish_run(
                     run_id,
                     status="skipped",
@@ -395,10 +498,14 @@ class SyncEngine:
                 return {"status": "skipped", "message": policy_message}
 
             selected = set(settings["content"]["categories"])
+            current_identity = self._vehicle_identity(settings)
+            if self.db.has_pending_recording_restores(current_identity):
+                selected.add("recordings")
             trip_cache: dict[str, Any] | None = None
             for category in CATEGORIES:
                 if category not in selected:
                     continue
+                self._check_cancelled()
                 self._set_state(
                     stage="syncing",
                     current=category.replace("_", " ").title(),
@@ -434,7 +541,7 @@ class SyncEngine:
                         self._collect_roadsense(client, settings, totals)
                     elif category == "configuration":
                         self._collect_configuration(client, settings, totals)
-                except PolicyPause:
+                except (PolicyPause, SyncCancelled):
                     raise
                 except OverdriveError as exc:
                     totals.error_count += 1
@@ -445,12 +552,16 @@ class SyncEngine:
                     errors.append(f"{category}: unexpected collector failure")
                     log.exception("Collector %s failed unexpectedly: %s", category, exc)
 
+            self._check_cancelled()
             final_status = "partial" if errors else "success"
             message = (
                 "; ".join(errors[:5])
                 if errors
                 else f"Archived {totals.items_added} new item(s)."
             )
+        except SyncCancelled as exc:
+            final_status = "cancelled"
+            message = str(exc)
         except PolicyPause as exc:
             final_status = "partial" if totals.items_added else "skipped"
             message = str(exc)
@@ -463,6 +574,34 @@ class SyncEngine:
             final_status = "failed"
             message = "Unexpected synchronization failure. Check the container logs."
             log.exception("Sync run %s failed", run_id)
+
+        if final_status != "cancelled":
+            try:
+                self._check_cancelled()
+                retention_result = self.apply_retention(self.db.get_settings())
+                removed = int(retention_result.get("deleted_items") or 0)
+                if removed:
+                    message = f"{message} Retention removed {removed} local item(s)."
+                if retention_result.get("limit_satisfied") is False:
+                    message = (
+                        f"{message} Storage limit could not be reached because "
+                        "the remaining items are protected or unmanaged."
+                    )
+                retention_errors = int(retention_result.get("error_count") or 0)
+                if retention_errors:
+                    totals.error_count += retention_errors
+                    if final_status == "success":
+                        final_status = "partial"
+                    message = f"{message} Retention could not remove some local items."
+            except SyncCancelled as exc:
+                final_status = "cancelled"
+                message = str(exc)
+            except Exception:
+                totals.error_count += 1
+                if final_status == "success":
+                    final_status = "partial"
+                message = f"{message} Local retention failed; check the container logs."
+                log.exception("Retention failed after sync run %s", run_id)
 
         self.db.finish_run(
             run_id,
@@ -492,8 +631,293 @@ class SyncEngine:
         destination.mkdir(parents=True, exist_ok=True)
         return destination
 
+    def apply_retention(
+        self,
+        settings: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Apply local-only age and storage policies without touching the vehicle."""
+        with self._state_lock:
+            active_elsewhere = self._active and threading.current_thread() is not self._sync_thread
+        if active_elsewhere or not self._retention_lock.acquire(blocking=False):
+            return {"status": "deferred", "deleted_items": 0, "deleted_bytes": 0}
+        with self._state_lock:
+            active_elsewhere = (
+                self._active and threading.current_thread() is not self._sync_thread
+            )
+            if active_elsewhere:
+                self._retention_lock.release()
+                return {"status": "deferred", "deleted_items": 0, "deleted_bytes": 0}
+            self._retention_active = True
+        try:
+            settings = settings or self.db.get_settings()
+            retention = settings["retention"]
+            category_rules = retention["categories"]
+            storage_rule = retention["storage_limit"]
+            if not storage_rule["enabled"] and not any(
+                rule["enabled"] for rule in category_rules.values()
+            ):
+                return {"status": "disabled", "deleted_items": 0, "deleted_bytes": 0}
+
+            candidates = self.db.list_retention_candidates()
+            manually_protected = self.db.list_retention_protected_source_keys()
+            protected_ids: set[int] = {
+                int(item["id"])
+                for item in candidates
+                if str(item["source_key"]) in manually_protected
+            }
+            for category, rule in category_rules.items():
+                if not rule["keep_latest_enabled"]:
+                    continue
+                category_items = [
+                    item for item in candidates if item["category"] == category
+                ]
+                category_items.sort(
+                    key=self._retention_item_sort_key,
+                    reverse=True,
+                )
+                protected_ids.update(
+                    int(item["id"])
+                    for item in category_items[: int(rule["keep_latest_count"])]
+                )
+
+            now = datetime.now(timezone.utc)
+            deleted_ids: set[int] = set()
+            deleted_items = 0
+            deleted_bytes = 0
+            error_count = 0
+
+            for item in candidates:
+                self._check_cancelled()
+                item_id = int(item["id"])
+                rule = category_rules.get(str(item["category"]))
+                if not rule or not rule["enabled"] or item_id in protected_ids:
+                    continue
+                seconds = int(rule["value"]) * {
+                    "minutes": 60,
+                    "hours": 3600,
+                    "days": 86400,
+                }[rule["unit"]]
+                if self._retention_item_datetime(item) >= now - timedelta(seconds=seconds):
+                    continue
+                deleted, freed, cleanup_error = self._delete_local_archive_item(item)
+                if deleted:
+                    deleted_ids.add(item_id)
+                    deleted_items += 1
+                    deleted_bytes += freed
+                if cleanup_error:
+                    error_count += 1
+
+            usage = self._archive_usage_bytes()
+            limit = int(storage_rule["max_bytes"]) if storage_rule["enabled"] else 0
+            if limit and usage > limit:
+                quota_candidates = [
+                    item
+                    for item in candidates
+                    if int(item["id"]) not in deleted_ids
+                    and int(item["id"]) not in protected_ids
+                ]
+                quota_candidates.sort(key=self._retention_item_sort_key)
+                for item in quota_candidates:
+                    self._check_cancelled()
+                    if usage <= limit:
+                        break
+                    deleted, freed, cleanup_error = self._delete_local_archive_item(item)
+                    if deleted:
+                        deleted_ids.add(int(item["id"]))
+                        deleted_items += 1
+                        deleted_bytes += freed
+                        usage = max(0, usage - freed)
+                    if cleanup_error:
+                        error_count += 1
+
+            final_usage = self._archive_usage_bytes()
+            satisfied = not limit or final_usage <= limit
+            return {
+                "status": "complete" if error_count == 0 else "partial",
+                "deleted_items": deleted_items,
+                "deleted_bytes": deleted_bytes,
+                "error_count": error_count,
+                "usage_bytes": final_usage,
+                "limit_bytes": limit,
+                "limit_satisfied": satisfied,
+                "protected_items": len(protected_ids),
+            }
+        finally:
+            with self._state_lock:
+                self._retention_active = False
+            self._retention_lock.release()
+
+    @staticmethod
+    def _retention_item_datetime(item: dict[str, Any]) -> datetime:
+        try:
+            timestamp = int(item.get("source_timestamp") or 0)
+            if timestamp > 0:
+                seconds = timestamp / 1000 if timestamp >= 10_000_000_000 else timestamp
+                return datetime.fromtimestamp(seconds, timezone.utc)
+        except (OSError, OverflowError, TypeError, ValueError):
+            pass
+        try:
+            created = datetime.fromisoformat(str(item.get("created_at") or ""))
+            return created.replace(tzinfo=timezone.utc) if created.tzinfo is None else created
+        except ValueError:
+            return datetime.min.replace(tzinfo=timezone.utc)
+
+    @classmethod
+    def _retention_item_sort_key(cls, item: dict[str, Any]) -> tuple[datetime, int]:
+        return cls._retention_item_datetime(item), int(item["id"])
+
+    def _retention_safe_path(self, relative_value: Any) -> Path:
+        relative = Path(str(relative_value or ""))
+        if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+            raise ValueError("Unsafe archived path.")
+        root = self.archive_root.resolve()
+        current = root
+        for part in relative.parts[:-1]:
+            current /= part
+            if current.is_symlink():
+                raise ValueError("Archived path traverses a symbolic link.")
+        return root.joinpath(relative)
+
+    def _delete_local_archive_item(
+        self, item: dict[str, Any]
+    ) -> tuple[bool, int, bool]:
+        try:
+            primary = self._retention_safe_path(item.get("relative_path"))
+        except (OSError, TypeError, ValueError):
+            log.error("Retention refused an unsafe archive item path for item %s", item.get("id"))
+            return False, 0, True
+        sidecars: list[Path] = []
+        if item.get("category") == "recordings":
+            partial = primary.with_suffix(primary.suffix + ".part")
+            sidecars.extend(
+                (
+                    primary.with_suffix(".jpg"),
+                    primary.with_suffix(".metadata.json"),
+                    primary.with_suffix(".events.json"),
+                    partial,
+                    partial.with_name(partial.name + ".meta"),
+                )
+            )
+
+        # Keep the primary recoverable until the inventory-to-tombstone
+        # transaction commits. Otherwise a transient SQLite failure after an
+        # unlink would leave a library row pointing at a missing file.
+        staged_primary: Path | None = None
+        primary_info: os.stat_result | None = None
+        try:
+            primary_info = primary.lstat()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return False, 0, True
+        if primary_info is not None:
+            if stat.S_ISDIR(primary_info.st_mode):
+                return False, 0, True
+            for _ in range(20):
+                candidate = primary.with_name(
+                    f".retention-{int(item['id'])}-{secrets.token_hex(12)}.pending"
+                )
+                try:
+                    candidate.lstat()
+                except FileNotFoundError:
+                    staged_primary = candidate
+                    break
+                except OSError:
+                    return False, 0, True
+            if staged_primary is None:
+                return False, 0, True
+            try:
+                primary.replace(staged_primary)
+            except OSError:
+                return False, 0, True
+
+        try:
+            transitioned = self.db.delete_archive_item(int(item["id"]))
+        except Exception:
+            log.exception(
+                "Retention database transition failed for item %s",
+                item.get("id"),
+            )
+            transitioned = False
+        if not transitioned:
+            if staged_primary is not None:
+                try:
+                    primary.lstat()
+                except FileNotFoundError:
+                    try:
+                        staged_primary.replace(primary)
+                    except OSError:
+                        log.exception(
+                            "Retention could not restore staged item %s",
+                            item.get("id"),
+                        )
+                except OSError:
+                    log.exception(
+                        "Retention could not inspect rollback target for item %s",
+                        item.get("id"),
+                    )
+                else:
+                    log.error(
+                        "Retention rollback target already exists for item %s; "
+                        "the staged copy was preserved",
+                        item.get("id"),
+                    )
+            return False, 0, True
+
+        freed = 0
+        cleanup_ok = True
+        cleanup_paths: list[tuple[Path, os.stat_result | None]] = []
+        if staged_primary is not None:
+            cleanup_paths.append((staged_primary, primary_info))
+        cleanup_paths.extend((path, None) for path in sidecars)
+        for path, known_info in cleanup_paths:
+            try:
+                info = known_info or path.lstat()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                cleanup_ok = False
+                continue
+            if stat.S_ISDIR(info.st_mode):
+                cleanup_ok = False
+                continue
+            try:
+                path.unlink()
+                if stat.S_ISREG(info.st_mode):
+                    freed += max(0, int(info.st_size))
+            except OSError:
+                cleanup_ok = False
+        if not cleanup_ok:
+            log.warning(
+                "Retention removed item %s but could not remove every sidecar",
+                item.get("id"),
+            )
+        return True, freed, not cleanup_ok
+
+    def _archive_usage_bytes(self) -> int:
+        total = 0
+        for directory, names, filenames in os.walk(
+            self.archive_root,
+            topdown=True,
+            followlinks=False,
+        ):
+            base = Path(directory)
+            names[:] = [name for name in names if not (base / name).is_symlink()]
+            for filename in filenames:
+                try:
+                    info = (base / filename).lstat()
+                except OSError:
+                    continue
+                if stat.S_ISREG(info.st_mode):
+                    total += max(0, int(info.st_size))
+        return total
+
     def _vehicle_slug(self, settings: dict[str, Any]) -> str:
         return slugify(settings["vehicle"]["name"])
+
+    def configured_vehicle_identity(self) -> str:
+        """Return the stable identity implied by the saved vehicle settings."""
+        return self._vehicle_identity(self.db.get_settings())
 
     def _vehicle_identity(self, settings: dict[str, Any]) -> str:
         vehicle = settings["vehicle"]
@@ -534,36 +958,151 @@ class SyncEngine:
             raise OverdriveError("Vehicle returned an unsafe recording filename.")
         return filename
 
-    def _recording_iter(
+    @staticmethod
+    def _recording_is_selected(
+        item: dict[str, Any],
+        selected: set[str],
+        selected_severities: set[str],
+        include_unknown: bool,
+    ) -> bool:
+        filename = str(item.get("filename") or "")
+        subtype = recording_subtype(item, filename)
+        selection_key = recording_selection_key(subtype)
+        if selection_key is None:
+            if not include_unknown:
+                return False
+        elif selection_key not in selected:
+            return False
+        if subtype in {"surveillance", "proximity"} and selected_severities:
+            severity = str(item.get("peakSeverity") or "").upper()
+            if severity and severity not in selected_severities:
+                return False
+        return True
+
+    @staticmethod
+    def _recording_rows_within_retention(
+        rows: list[dict[str, Any]],
+        settings: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        rule = settings["retention"]["categories"]["recordings"]
+        if not rule["enabled"]:
+            return rows
+        multiplier = {"minutes": 60, "hours": 3600, "days": 86400}[rule["unit"]]
+        cutoff_ms = int((time.time() - int(rule["value"]) * multiplier) * 1000)
+        protected: set[str] = set()
+        def timestamp_for(row: dict[str, Any]) -> int:
+            try:
+                return max(0, int(row["item"].get("timestamp") or 0))
+            except (KeyError, TypeError, ValueError):
+                return 0
+
+        if rule["keep_latest_enabled"]:
+            ordered = sorted(
+                rows,
+                key=lambda row: (
+                    timestamp_for(row),
+                    str(row["source_key"]),
+                ),
+                reverse=True,
+            )
+            protected = {
+                str(row["source_key"])
+                for row in ordered[: int(rule["keep_latest_count"])]
+            }
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            timestamp_ms = timestamp_for(row)
+            if (
+                bool(row.get("restore_requested"))
+                or str(row["source_key"]) in protected
+                or timestamp_ms == 0
+                or timestamp_ms >= cutoff_ms
+            ):
+                result.append(row)
+        return result
+
+    def _build_recording_queue_entry(
         self,
         client: OverdriveClient,
-        types: list[str],
-        severities: list[str],
-        include_unknown: bool,
-    ):
-        selected = set(types)
-        selected_severities = set(severities)
-        if not selected and not include_unknown:
-            return
-        seen: set[str] = set()
-        # Fetch the complete list and apply policy locally. This preserves new
-        # Overdrive types that this release does not know about yet.
-        for item in client.iter_recordings([], []):
-            filename = str(item.get("filename") or "")
-            subtype = recording_subtype(item, filename)
-            selection_key = recording_selection_key(subtype)
-            if selection_key is None:
-                if not include_unknown:
-                    continue
-            elif selection_key not in selected:
-                continue
-            if subtype in {"surveillance", "proximity"} and selected_severities:
-                severity = str(item.get("peakSeverity") or "").upper()
-                if severity and severity not in selected_severities:
-                    continue
-            if filename and filename not in seen:
-                seen.add(filename)
-                yield item
+        settings: dict[str, Any],
+        item: dict[str, Any],
+        *,
+        identity: str,
+        vehicle: str,
+        known_before_run: bool,
+    ) -> RecordingQueueEntry:
+        filename = self._safe_filename(item.get("filename"))
+        subtype = recording_subtype(item, filename)
+        try:
+            timestamp_ms = max(0, int(item.get("timestamp") or 0))
+            expected_size = max(0, int(item.get("size") or 0))
+        except (TypeError, ValueError) as exc:
+            raise OverdriveError("Vehicle returned invalid recording metadata.") from exc
+        source_key = f"{identity}:recording:{filename}:{timestamp_ms}"
+        try:
+            date = (
+                datetime.fromtimestamp(timestamp_ms / 1000, timezone.utc)
+                if timestamp_ms > 0
+                else datetime.now(timezone.utc)
+            )
+        except (OSError, OverflowError, ValueError):
+            date = datetime.now(timezone.utc)
+        relative = (
+            Path(settings["destination"]["subdirectory"])
+            / vehicle
+            / "recordings"
+            / subtype
+            / f"{date:%Y}"
+            / f"{date:%m}"
+            / f"{date:%d}"
+            / filename
+        )
+        existing = self.db.get_item_by_source_key(source_key)
+        if existing is not None:
+            try:
+                existing_relative = Path(str(existing["relative_path"]))
+                final_path = self._safe_archive_path(existing_relative)
+                relative = existing_relative
+            except (KeyError, OSError, TypeError, ValueError):
+                final_path = self._safe_archive_path(relative)
+        else:
+            final_path = self._safe_archive_path(relative)
+        final_path.parent.mkdir(parents=True, exist_ok=True)
+
+        needs_download = not final_path.is_file()
+        if not needs_download:
+            actual_size = final_path.stat().st_size
+            required_size = expected_size
+            if not required_size and existing is not None:
+                required_size = max(0, int(existing.get("size_bytes") or 0))
+            needs_download = bool(required_size and actual_size != required_size)
+
+        partial_path = final_path.with_suffix(final_path.suffix + ".part")
+        partial_size = 0
+        if needs_download:
+            partial_size = OverdriveClient.resumable_size(
+                partial_path,
+                source_identity=source_key,
+                expected_size=expected_size,
+            )
+        else:
+            OverdriveClient._discard_partial(partial_path)
+
+        return RecordingQueueEntry(
+            item=dict(item),
+            source_key=source_key,
+            filename=filename,
+            subtype=subtype,
+            timestamp_ms=timestamp_ms,
+            expected_size=expected_size,
+            relative=relative,
+            final_path=final_path,
+            partial_path=partial_path,
+            existing=existing,
+            needs_download=needs_download,
+            partial_size=partial_size,
+            known_before_run=known_before_run,
+        )
 
     def _collect_recordings(
         self,
@@ -576,173 +1115,307 @@ class SyncEngine:
         identity = self._vehicle_identity(settings)
         self._destination_base(settings)
         policy_check = self._download_policy_check(client, settings)
+        selected_types = set(content["recording_types"])
+        selected_severities = set(content["severities"])
+        include_unknown = content["include_unknown_recording_types"]
 
-        for item in self._recording_iter(
-            client,
-            content["recording_types"],
-            content["severities"],
-            content["include_unknown_recording_types"],
-        ):
+        self._set_state(stage="discovering", current="Building a fixed recording queue")
+        remote_items: list[dict[str, Any]] = []
+        seen_filenames: set[str] = set()
+        for item in client.iter_recordings([], []):
+            self._check_cancelled()
             filename = self._safe_filename(item.get("filename"))
-            subtype = recording_subtype(item, filename)
-            timestamp_ms = int(item.get("timestamp") or 0)
-            expected_size = max(0, int(item.get("size") or 0))
+            if filename in seen_filenames:
+                raise OverdriveError(
+                    "Recordings API returned a duplicate filename."
+                )
+            seen_filenames.add(filename)
+            remote_items.append(dict(item))
+        self._check_cancelled()
+        all_live_jobs: dict[str, dict[str, Any]] = {}
+        for item in remote_items:
+            filename = self._safe_filename(item.get("filename"))
+            try:
+                timestamp_ms = max(0, int(item.get("timestamp") or 0))
+            except (TypeError, ValueError) as exc:
+                raise OverdriveError("Vehicle returned invalid recording metadata.") from exc
             source_key = f"{identity}:recording:{filename}:{timestamp_ms}"
+            all_live_jobs[source_key] = dict(item)
 
-            date = (
-                datetime.fromtimestamp(timestamp_ms / 1000, timezone.utc)
-                if timestamp_ms > 0
-                else datetime.now(timezone.utc)
-            )
-            relative = (
-                Path(settings["destination"]["subdirectory"])
-                / vehicle
-                / "recordings"
-                / subtype
-                / f"{date:%Y}"
-                / f"{date:%m}"
-                / f"{date:%d}"
-                / filename
-            )
-            existing = self.db.get_item_by_source_key(source_key)
-            if existing is not None:
-                try:
-                    existing_relative = Path(str(existing["relative_path"]))
-                    final_path = self._safe_archive_path(existing_relative)
-                    relative = existing_relative
-                except (KeyError, OSError, TypeError, ValueError):
-                    final_path = self._safe_archive_path(relative)
-            else:
-                final_path = self._safe_archive_path(relative)
-            final_path.parent.mkdir(parents=True, exist_ok=True)
-
-            if existing is not None and final_path.is_file():
-                actual_size = final_path.stat().st_size
-                required_size = expected_size or max(
-                    0, int(existing.get("size_bytes") or 0)
-                )
-                if not required_size or actual_size == required_size:
-                    if content["include_thumbnails"]:
-                        self._ensure_recording_thumbnail(
-                            client,
-                            item,
-                            final_path,
-                        )
-                    archive_metadata = self._prepare_recording_metadata(
-                        client,
-                        item,
-                        subtype,
-                        filename,
-                        final_path,
-                        settings,
-                    )
-                    digest = str(existing.get("sha256") or "")
-                    if not digest:
-                        _size, digest = self._hash_file(final_path)
-                    updated = self.db.update_item(
-                        source_key=source_key,
-                        category="recordings",
-                        subtype=subtype,
-                        vehicle=vehicle,
-                        filename=filename,
-                        relative_path=str(relative),
-                        media_type="video/mp4",
-                        size_bytes=actual_size,
-                        sha256=digest,
-                        source_timestamp=timestamp_ms or None,
-                        metadata=archive_metadata,
-                    )
-                    if not updated:
-                        raise OverdriveError(
-                            f"Could not refresh the inventory entry for {filename}."
-                        )
-                    totals.items_skipped += 1
-                    continue
-
-            needs_download = not final_path.is_file()
-            if not needs_download:
-                size, digest = self._hash_file(final_path)
-                needs_download = bool(expected_size and size != expected_size)
-
-            if needs_download:
-                self._set_state(stage="downloading", current=filename)
-                partial = self._temporary_path(final_path)
-                try:
-                    size, digest = client.download_to(
-                        str(item.get("videoUrl") or f"/video/{client.encoded_filename(filename)}"),
-                        partial,
-                        max_bytes=self.max_recording_bytes,
-                        policy_check=policy_check,
-                    )
-                    if expected_size and size != expected_size:
-                        raise OverdriveError(
-                            f"Recording size mismatch for {filename}: expected {expected_size}, received {size}."
-                        )
-                    os.replace(partial, final_path)
-                    try:
-                        os.chmod(final_path, 0o600)
-                    except OSError:
-                        pass
-                    totals.bytes_added += size
-                finally:
-                    try:
-                        partial.unlink(missing_ok=True)
-                    except OSError:
-                        pass
-
-            if content["include_thumbnails"]:
-                self._ensure_recording_thumbnail(
-                    client,
+        # Reconcile deleted-local placeholders only after every API page was
+        # fetched successfully. A timeout or partial listing never implies that
+        # a recording disappeared from the vehicle.
+        self.db.reconcile_recording_tombstones(identity, all_live_jobs)
+        live_jobs: dict[str, dict[str, Any]] = {}
+        for source_key, item in all_live_jobs.items():
+            restore_requested = self.db.recording_restore_requested(source_key)
+            if restore_requested or (
+                not self.db.is_retention_tombstoned(source_key)
+                and self._recording_is_selected(
                     item,
-                    final_path,
+                    selected_types,
+                    selected_severities,
+                    include_unknown,
                 )
-            archive_metadata = self._prepare_recording_metadata(
-                client,
+            ):
+                live_jobs[source_key] = dict(item)
+
+        known_live_keys = self.db.remember_recording_download_jobs(identity, live_jobs)
+        new_keys = set(live_jobs) - known_live_keys
+        stored_rows: list[dict[str, Any]] = []
+        for stored in self.db.list_recording_download_jobs(identity):
+            self._check_cancelled()
+            source_key = str(stored["source_key"])
+            if source_key not in all_live_jobs:
+                self.db.complete_recording_download_job(source_key)
+                continue
+            restore_requested = self.db.recording_restore_requested(source_key)
+            if self.db.is_retention_tombstoned(source_key) and not restore_requested:
+                self.db.complete_recording_download_job(str(stored["source_key"]))
+                continue
+            item = stored["item"]
+            if not restore_requested and not self._recording_is_selected(
                 item,
-                subtype,
-                filename,
-                final_path,
+                selected_types,
+                selected_severities,
+                include_unknown,
+            ):
+                continue
+            stored["restore_requested"] = restore_requested
+            stored_rows.append(stored)
+
+        entries: list[RecordingQueueEntry] = []
+        for stored in self._recording_rows_within_retention(stored_rows, settings):
+            item = stored["item"]
+            entry = self._build_recording_queue_entry(
+                client,
                 settings,
+                item,
+                identity=identity,
+                vehicle=vehicle,
+                known_before_run=str(stored["source_key"]) not in new_keys,
+            )
+            if entry.source_key != str(stored["source_key"]):
+                raise OverdriveError("Stored recording queue identity is inconsistent.")
+            entries.append(entry)
+
+        downloads = sorted(
+            (entry for entry in entries if entry.needs_download),
+            key=recording_queue_priority,
+        )
+        already_local = sorted(
+            (entry for entry in entries if not entry.needs_download),
+            key=recording_queue_priority,
+        )
+        progress_by_key = {
+            entry.source_key: (entry.partial_size if entry.expected_size else 0)
+            for entry in downloads
+        }
+        known_total = sum(entry.expected_size for entry in downloads if entry.expected_size)
+        unknown_sizes = sum(1 for entry in downloads if not entry.expected_size)
+        queue_done = sum(progress_by_key.values())
+        queue_items_done = 0
+        self._set_state(
+            stage="queued",
+            current=f"{len(downloads)} recording(s) queued",
+            queue_bytes_done=queue_done,
+            queue_bytes_total=known_total,
+            queue_items_done=0,
+            queue_items_total=len(downloads),
+            queue_unknown_sizes=unknown_sizes,
+            queue_bytes_indeterminate=bool(unknown_sizes),
+        )
+
+        transfer_failures: list[str] = []
+        for entry in downloads:
+            self._check_cancelled()
+            self._set_state(stage="downloading", current=entry.filename)
+
+            def update_progress(
+                current_bytes: int,
+                _current_total: int,
+                *,
+                source_key: str = entry.source_key,
+                expected_size: int = entry.expected_size,
+            ) -> None:
+                nonlocal queue_done
+                if not expected_size:
+                    return
+                bounded = min(expected_size, max(0, int(current_bytes)))
+                previous = progress_by_key[source_key]
+                if bounded != previous:
+                    progress_by_key[source_key] = bounded
+                    queue_done += bounded - previous
+                    self._set_state(queue_bytes_done=queue_done)
+
+            try:
+                self._download_recording_queue_entry(
+                    client,
+                    settings,
+                    content,
+                    totals,
+                    vehicle,
+                    entry,
+                    policy_check,
+                    update_progress,
+                )
+            except (PolicyPause, SyncCancelled):
+                raise
+            except OverdriveError as exc:
+                transfer_failures.append(f"{entry.filename}: {exc}")
+                log.warning("Recording transfer failed for %s: %s", entry.filename, exc)
+                continue
+            queue_items_done += 1
+            self._set_state(
+                queue_items_done=queue_items_done,
+                queue_bytes_done=queue_done,
+            )
+            self._check_cancelled()
+
+        # Existing local files are refreshed after transfer work so thumbnail
+        # and metadata backfills cannot delay the frozen download queue.
+        for entry in already_local:
+            self._check_cancelled()
+            size = entry.final_path.stat().st_size
+            digest = str((entry.existing or {}).get("sha256") or "")
+            if not digest:
+                _size, digest = self._hash_file(entry.final_path)
+            self._inventory_recording(
+                client,
+                settings,
+                content,
+                totals,
+                vehicle,
+                entry,
+                size,
+                digest,
+                policy_check,
+            )
+            if self.db.recording_restore_requested(entry.source_key):
+                self.db.complete_recording_restore(entry.source_key)
+            self.db.complete_recording_download_job(entry.source_key)
+
+        if transfer_failures:
+            raise OverdriveError(
+                f"{len(transfer_failures)} recording(s) remain queued; "
+                f"first failure: {transfer_failures[0]}"
             )
 
-            if existing is not None:
-                updated = self.db.update_item(
-                    source_key=source_key,
-                    category="recordings",
-                    subtype=subtype,
-                    vehicle=vehicle,
-                    filename=filename,
-                    relative_path=str(relative),
-                    media_type="video/mp4",
-                    size_bytes=size,
-                    sha256=digest,
-                    source_timestamp=timestamp_ms or None,
-                    metadata=archive_metadata,
+    def _download_recording_queue_entry(
+        self,
+        client: OverdriveClient,
+        settings: dict[str, Any],
+        content: dict[str, Any],
+        totals: RunTotals,
+        vehicle: str,
+        entry: RecordingQueueEntry,
+        policy_check: Callable[[], None],
+        update_progress: Callable[[int, int], None],
+    ) -> None:
+        size, digest = client.download_to(
+            str(
+                entry.item.get("videoUrl")
+                or f"/video/{client.encoded_filename(entry.filename)}"
+            ),
+            entry.partial_path,
+            max_bytes=self.max_recording_bytes,
+            policy_check=policy_check,
+            resume=True,
+            source_identity=entry.source_key,
+            expected_size=entry.expected_size,
+            progress_callback=update_progress,
+        )
+        if entry.expected_size and size != entry.expected_size:
+            raise OverdriveError(
+                f"Recording size mismatch for {entry.filename}: "
+                f"expected {entry.expected_size}, received {size}."
+            )
+        update_progress(size, entry.expected_size)
+        os.replace(entry.partial_path, entry.final_path)
+        OverdriveClient.discard_resume_metadata(entry.partial_path)
+        try:
+            os.chmod(entry.final_path, 0o600)
+        except OSError:
+            pass
+        totals.bytes_added += size
+        self._inventory_recording(
+            client,
+            settings,
+            content,
+            totals,
+            vehicle,
+            entry,
+            size,
+            digest,
+            policy_check,
+        )
+        if self.db.recording_restore_requested(entry.source_key):
+            self.db.complete_recording_restore(entry.source_key)
+        self.db.complete_recording_download_job(entry.source_key)
+
+    def _inventory_recording(
+        self,
+        client: OverdriveClient,
+        settings: dict[str, Any],
+        content: dict[str, Any],
+        totals: RunTotals,
+        vehicle: str,
+        entry: RecordingQueueEntry,
+        size: int,
+        digest: str,
+        policy_check: Callable[[], None],
+    ) -> None:
+        """Persist one complete recording as an indivisible queue unit."""
+        if content["include_thumbnails"]:
+            self._ensure_recording_thumbnail(
+                client,
+                entry.item,
+                entry.final_path,
+                policy_check,
+            )
+        archive_metadata = self._prepare_recording_metadata(
+            client,
+            entry.item,
+            entry.subtype,
+            entry.filename,
+            entry.final_path,
+            settings,
+            policy_check,
+        )
+        if entry.existing is not None:
+            if not self.db.update_item(
+                source_key=entry.source_key,
+                category="recordings",
+                subtype=entry.subtype,
+                vehicle=vehicle,
+                filename=entry.filename,
+                relative_path=str(entry.relative),
+                media_type="video/mp4",
+                size_bytes=size,
+                sha256=digest,
+                source_timestamp=entry.timestamp_ms or None,
+                metadata=archive_metadata,
+            ):
+                raise OverdriveError(
+                    f"Could not refresh the inventory entry for {entry.filename}."
                 )
-                if updated:
-                    totals.items_skipped += 1
-                else:
-                    raise OverdriveError(
-                        f"Could not update the repaired inventory entry for {filename}."
-                    )
-            else:
-                added = self.db.add_item(
-                    source_key=source_key,
-                    category="recordings",
-                    subtype=subtype,
-                    vehicle=vehicle,
-                    filename=filename,
-                    relative_path=str(relative),
-                    media_type="video/mp4",
-                    size_bytes=size,
-                    sha256=digest,
-                    source_timestamp=timestamp_ms or None,
-                    metadata=archive_metadata,
-                )
-                if added:
-                    totals.items_added += 1
-                else:
-                    totals.items_skipped += 1
+            totals.items_skipped += 1
+        elif self.db.add_item(
+            source_key=entry.source_key,
+            category="recordings",
+            subtype=entry.subtype,
+            vehicle=vehicle,
+            filename=entry.filename,
+            relative_path=str(entry.relative),
+            media_type="video/mp4",
+            size_bytes=size,
+            sha256=digest,
+            source_timestamp=entry.timestamp_ms or None,
+            metadata=archive_metadata,
+        ):
+            totals.items_added += 1
+        else:
+            totals.items_skipped += 1
 
     def _prepare_recording_metadata(
         self,
@@ -752,6 +1425,7 @@ class SyncEngine:
         filename: str,
         final_path: Path,
         settings: dict[str, Any],
+        policy_check: Callable[[], None],
     ) -> dict[str, Any]:
         event_payload: dict[str, Any] | None = None
         content = settings["content"]
@@ -763,6 +1437,7 @@ class SyncEngine:
                 client,
                 f"/api/events/{client.encoded_filename(filename)}",
                 final_path.with_suffix(".events.json"),
+                policy_check,
             )
         archive_metadata = dict(item)
         archive_metadata["archiveRecordingSubtype"] = subtype
@@ -785,11 +1460,13 @@ class SyncEngine:
         totals: RunTotals,
     ) -> dict[str, Any]:
         range_params = {"from": 1, "to": int(time.time() * 1000)}
+        self._check_cancelled()
         payload = client.fetch_paginated(
             "/api/trips",
             "trips",
             extra_params=range_params,
         )
+        self._check_cancelled()
         self._archive_snapshot(settings, totals, "trips", payload)
         return payload
 
@@ -799,11 +1476,13 @@ class SyncEngine:
         settings: dict[str, Any],
         totals: RunTotals,
     ) -> None:
+        self._check_cancelled()
         payload = client.fetch_paginated(
             "/api/charging",
             "sessions",
             extra_params={"days": 0},
         )
+        self._check_cancelled()
         self._archive_snapshot(settings, totals, "charging", payload)
 
     def _collect_simple(
@@ -814,11 +1493,14 @@ class SyncEngine:
         category: str,
         path: str,
     ) -> None:
+        self._check_cancelled()
+        payload = client.get_json(path)
+        self._check_cancelled()
         self._archive_snapshot(
             settings,
             totals,
             category,
-            client.get_json(path),
+            payload,
         )
 
     def _collect_telemetry(
@@ -828,7 +1510,9 @@ class SyncEngine:
         totals: RunTotals,
         trip_cache: dict[str, Any] | None,
     ) -> dict[str, Any]:
+        self._check_cancelled()
         current = client.get_json("/api/mqtt/telemetry")
+        self._check_cancelled()
         self._archive_snapshot(settings, totals, "telemetry", current, "live")
 
         if trip_cache is None:
@@ -843,6 +1527,7 @@ class SyncEngine:
             return trip_cache
         identity = self._vehicle_identity(settings)
         for trip in trips:
+            self._check_cancelled()
             if not isinstance(trip, dict):
                 continue
             trip_id = trip.get("id")
@@ -877,6 +1562,7 @@ class SyncEngine:
                 source_key=source_key,
                 source_timestamp=start_time or None,
             )
+            self._check_cancelled()
         return trip_cache
 
     def _collect_roadsense(
@@ -890,6 +1576,7 @@ class SyncEngine:
         lon_edges = (-180, -120, -60, 0, 60, 120, 180)
         for lat_index in range(len(lat_edges) - 1):
             for lon_index in range(len(lon_edges) - 1):
+                self._check_cancelled()
                 bbox = (
                     lon_edges[lon_index],
                     lat_edges[lat_index],
@@ -929,7 +1616,9 @@ class SyncEngine:
         settings: dict[str, Any],
         totals: RunTotals,
     ) -> None:
+        self._check_cancelled()
         payload = client.get_json("/api/settings/unified")
+        self._check_cancelled()
         redacted = self._redact_configuration(payload)
         self._archive_snapshot(settings, totals, "configuration", redacted)
 
@@ -944,6 +1633,7 @@ class SyncEngine:
         source_key: str | None = None,
         source_timestamp: int | None = None,
     ) -> None:
+        self._check_cancelled()
         canonical = json.dumps(
             payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
         ).encode("utf-8")
@@ -996,6 +1686,7 @@ class SyncEngine:
 
         def check() -> None:
             nonlocal last_check
+            self._check_cancelled()
             now = time.monotonic()
             if now - last_check < 30:
                 return
@@ -1016,17 +1707,25 @@ class SyncEngine:
         source_path: str,
         destination: Path,
         max_bytes: int,
+        policy_check: Callable[[], None],
     ) -> None:
         if not source_path or destination.exists():
             return
         partial = self._temporary_path(destination)
         try:
-            client.download_to(source_path, partial, max_bytes=max_bytes)
+            client.download_to(
+                source_path,
+                partial,
+                max_bytes=max_bytes,
+                policy_check=policy_check,
+            )
             os.replace(partial, destination)
             try:
                 os.chmod(destination, 0o600)
             except OSError:
                 pass
+        except PolicyPause:
+            raise
         except OverdriveError as exc:
             log.info("Optional artifact unavailable: %s", exc)
         finally:
@@ -1037,6 +1736,7 @@ class SyncEngine:
         client: OverdriveClient,
         item: dict[str, Any],
         video_path: Path,
+        policy_check: Callable[[], None],
     ) -> None:
         destination = video_path.with_suffix(".jpg")
         if destination.is_file():
@@ -1050,10 +1750,13 @@ class SyncEngine:
             ),
             destination,
             20 * 1024 * 1024,
+            policy_check,
         )
         if destination.is_file():
             return
+        policy_check()
         self._generate_recording_thumbnail(video_path, destination)
+        policy_check()
 
     def _generate_recording_thumbnail(
         self,
@@ -1120,7 +1823,9 @@ class SyncEngine:
         client: OverdriveClient,
         source_path: str,
         destination: Path,
+        policy_check: Callable[[], None],
     ) -> dict[str, Any] | None:
+        policy_check()
         if destination.exists():
             try:
                 if destination.stat().st_size > 32 * 1024 * 1024:
@@ -1129,13 +1834,31 @@ class SyncEngine:
                 return payload if isinstance(payload, dict) else None
             except (OSError, UnicodeDecodeError, json.JSONDecodeError):
                 return None
+        partial = self._temporary_path(destination)
         try:
-            payload = client.get_json(source_path, max_bytes=32 * 1024 * 1024)
-            self._write_json(destination, payload)
+            client.download_to(
+                source_path,
+                partial,
+                max_bytes=32 * 1024 * 1024,
+                policy_check=policy_check,
+            )
+            payload = json.loads(partial.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("optional JSON artifact is not an object")
+            os.replace(partial, destination)
+            try:
+                os.chmod(destination, 0o600)
+            except OSError:
+                pass
+            policy_check()
             return payload
-        except OverdriveError as exc:
+        except PolicyPause:
+            raise
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, OverdriveError) as exc:
             log.info("Optional JSON artifact unavailable: %s", exc)
             return None
+        finally:
+            partial.unlink(missing_ok=True)
 
     def _write_json(self, destination: Path, payload: Any) -> None:
         raw = json.dumps(
@@ -1170,6 +1893,7 @@ class SyncEngine:
         size = 0
         with path.open("rb") as handle:
             while True:
+                self._check_cancelled()
                 chunk = handle.read(1024 * 1024)
                 if not chunk:
                     break
