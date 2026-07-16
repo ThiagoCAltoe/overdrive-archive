@@ -29,3 +29,5 @@
   keep-latest protection, filesystem-aware storage limits, visible zero-byte
   deleted-local placeholders, restore/pin controls, and safe vehicle
   reconciliation.
+- Durable retention cleanup journal for process-safe staging and restart
+  recovery.

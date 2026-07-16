@@ -356,6 +356,121 @@ class SyncEngineTests(unittest.TestCase):
         self.assertEqual(self.db.list_recording_download_jobs(identity), [])
         self.assertEqual(client.downloads, [])
 
+    def test_vanished_job_cleans_partial_without_touching_valid_item(self) -> None:
+        settings = self._recording_settings()
+        identity = self.engine._vehicle_identity(settings)
+        filename = "cam_vanished.mp4"
+        source_key = f"{identity}:recording:{filename}:{RECORDING_TIMESTAMP}"
+        remote_item = {
+            "filename": filename,
+            "type": "normal",
+            "timestamp": RECORDING_TIMESTAMP,
+            "size": 32 * 1024 * 1024,
+        }
+        date = datetime.fromtimestamp(RECORDING_TIMESTAMP / 1000, timezone.utc)
+        relative = (
+            Path(settings["destination"]["subdirectory"])
+            / self.engine._vehicle_slug(settings)
+            / "recordings"
+            / "drive"
+            / f"{date:%Y}"
+            / f"{date:%m}"
+            / f"{date:%d}"
+            / filename
+        )
+        final_path = self.engine.archive_root / relative
+        final_path.parent.mkdir(parents=True, exist_ok=True)
+        final_bytes = b"already archived and still valid"
+        final_path.write_bytes(final_bytes)
+        self.assertTrue(
+            self.db.add_item(
+                source_key=source_key,
+                category="recordings",
+                subtype="drive",
+                vehicle=self.engine._vehicle_slug(settings),
+                filename=filename,
+                relative_path=str(relative),
+                media_type="video/mp4",
+                size_bytes=len(final_bytes),
+                sha256=hashlib.sha256(final_bytes).hexdigest(),
+                source_timestamp=RECORDING_TIMESTAMP,
+                metadata=remote_item,
+            )
+        )
+
+        partial_path = final_path.with_suffix(final_path.suffix + ".part")
+        self.db.remember_recording_download_jobs(
+            identity,
+            {source_key: remote_item},
+            {
+                source_key: str(
+                    partial_path.relative_to(self.engine.archive_root)
+                )
+            },
+        )
+        with partial_path.open("wb") as handle:
+            handle.truncate(32 * 1024 * 1024)
+        outside_target = Path(self.temp.name) / "outside-resume-metadata.json"
+        outside_target.write_text("outside must survive", encoding="utf-8")
+        metadata_path = partial_path.with_name(partial_path.name + ".meta")
+        metadata_path.symlink_to(outside_target)
+
+        renamed_settings = self._recording_settings("Renamed family car")
+        client = QueueRecordingClient([])
+        self.engine._collect_recordings(client, renamed_settings, RunTotals())
+
+        self.assertFalse(partial_path.exists())
+        self.assertFalse(metadata_path.exists())
+        self.assertEqual(
+            outside_target.read_text(encoding="utf-8"),
+            "outside must survive",
+        )
+        self.assertEqual(final_path.read_bytes(), final_bytes)
+        self.assertIsNotNone(self.db.get_item_by_source_key(source_key))
+        self.assertEqual(self.db.list_recording_download_jobs(identity), [])
+        self.assertEqual(client.downloads, [])
+
+    def test_vanished_job_uses_effective_inventory_path_after_vehicle_rename(
+        self,
+    ) -> None:
+        original_settings = self._recording_settings("Original family car")
+        initial_client = FakeRecordingClient()
+        self.engine._collect_recordings(
+            initial_client, original_settings, RunTotals()
+        )
+        archived = self.db.list_items(category="recordings")[0]
+        final_path = self.engine.archive_root / archived["relative_path"]
+        final_path.unlink()
+
+        renamed_settings = self._recording_settings("Renamed family car")
+
+        class InterruptedClient(FakeRecordingClient):
+            def download_to(self, _path, destination, **_kwargs):
+                destination.write_bytes(b"partial")
+                raise OverdriveError("interrupted after partial for test")
+
+        with self.assertRaisesRegex(OverdriveError, "remain queued"):
+            self.engine._collect_recordings(
+                InterruptedClient(), renamed_settings, RunTotals()
+            )
+
+        identity = self.engine._vehicle_identity(renamed_settings)
+        jobs = self.db.list_recording_download_jobs(identity)
+        self.assertEqual(len(jobs), 1)
+        effective_partial = final_path.with_suffix(final_path.suffix + ".part")
+        self.assertEqual(
+            jobs[0]["partial_relative_path"],
+            str(effective_partial.relative_to(self.engine.archive_root)),
+        )
+        self.assertTrue(effective_partial.exists())
+
+        self.engine._collect_recordings(
+            QueueRecordingClient([]), renamed_settings, RunTotals()
+        )
+
+        self.assertFalse(effective_partial.exists())
+        self.assertEqual(self.db.list_recording_download_jobs(identity), [])
+
     def test_failed_listing_never_reconciles_deleted_placeholders(self) -> None:
         settings = self._recording_settings()
         client = FakeRecordingClient()

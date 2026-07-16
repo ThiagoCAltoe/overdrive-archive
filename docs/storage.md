@@ -93,6 +93,12 @@ original. The placeholder blocks automatic redownload and offers **Download
 again**. A restored file is pinned against automatic retention until **Use
 retention rules** removes that pin; current rules may then apply immediately.
 
+The primary-file transition uses a durable SQLite cleanup journal. Startup
+restores a staged file when its inventory row is still authoritative, or
+finishes local cleanup when the tombstone was already committed. This covers
+process and container interruption; physical power-loss durability depends on
+the mounted filesystem and storage appliance.
+
 The placeholder is removed only after a complete, internally consistent remote
 listing confirms that the recording left the vehicle. Failed, partial, timed-out,
 or cancelled listings never purge it. The application never calls a deletion

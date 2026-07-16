@@ -412,12 +412,15 @@ class OverdriveClient:
         if existing > max_bytes:
             self._discard_partial(destination)
             raise OverdriveError("Recording exceeded the configured size limit.")
-        if expected and existing == expected:
+        completed_total = expected
+        if not completed_total and metadata is not None:
+            completed_total = int(metadata["total_size"])
+        if completed_total and existing == completed_total:
             if policy_check:
                 policy_check()
             size, digest_hex = self._hash_download(destination, policy_check)
             if progress_callback:
-                progress_callback(size, expected)
+                progress_callback(size, completed_total)
             return size, digest_hex
 
         request_headers: dict[str, str] = {}

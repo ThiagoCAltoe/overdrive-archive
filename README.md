@@ -566,6 +566,12 @@ listing still reports the original on the vehicle. The placeholder prevents an
 automatic redownload, shows the remote file size separately, and offers
 **Download again**.
 
+Local deletion is journaled before any primary file is moved. After an
+interrupted process or container restart, startup either restores the inventory
+file or finishes the already-committed cleanup, so an application crash cannot
+strand an untracked hidden copy. Physical power-loss durability still follows
+the guarantees of the mounted local, NFS, or SMB filesystem.
+
 Restoring a recording bypasses the current type, severity, and age filters but
 still follows the configured network policy. A restored file is manually
 protected from retention so the same rule cannot immediately remove it again.

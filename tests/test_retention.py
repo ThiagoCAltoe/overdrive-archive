@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -169,6 +170,73 @@ class RetentionTests(unittest.TestCase):
         self.assertIsNotNone(self.db.get_item(int(item["id"])))
         self.assertFalse(self.db.is_retention_tombstoned(item["source_key"]))
 
+    def test_startup_restores_a_primary_staged_before_database_commit(self) -> None:
+        item = self._add_item("crash-before-commit.mp4", age_days=180, sidecars=True)
+        item_id = int(item["id"])
+        primary = self.engine.archive_root / item["relative_path"]
+        staged = primary.with_name(
+            f".retention-{item_id}-{'a' * 24}.pending"
+        )
+        staged_relative = staged.relative_to(self.engine.archive_root)
+        self.assertIsNotNone(
+            self.db.prepare_retention_deletion(item_id, str(staged_relative))
+        )
+        primary.replace(staged)
+
+        SyncEngine(self.db, self.engine.archive_root)
+
+        self.assertTrue(primary.exists())
+        self.assertFalse(staged.exists())
+        self.assertIsNotNone(self.db.get_item(item_id))
+        self.assertFalse(self.db.is_retention_tombstoned(item["source_key"]))
+        self.assertEqual(self.db.list_retention_deletion_jobs(), [])
+
+    def test_startup_finishes_cleanup_staged_after_database_commit(self) -> None:
+        item = self._add_item("crash-after-commit.mp4", age_days=180, sidecars=True)
+        item_id = int(item["id"])
+        primary = self.engine.archive_root / item["relative_path"]
+        thumbnail = primary.with_suffix(".jpg")
+        staged = primary.with_name(
+            f".retention-{item_id}-{'b' * 24}.pending"
+        )
+        staged_relative = staged.relative_to(self.engine.archive_root)
+        self.assertIsNotNone(
+            self.db.prepare_retention_deletion(item_id, str(staged_relative))
+        )
+        primary.replace(staged)
+        self.assertTrue(self.db.delete_archive_item(item_id))
+
+        SyncEngine(self.db, self.engine.archive_root)
+
+        self.assertFalse(primary.exists())
+        self.assertFalse(staged.exists())
+        self.assertFalse(thumbnail.exists())
+        self.assertIsNone(self.db.get_item(item_id))
+        self.assertTrue(self.db.is_retention_tombstoned(item["source_key"]))
+        self.assertEqual(self.db.list_retention_deletion_jobs(), [])
+
+    def test_graceful_stop_waits_for_active_retention_boundary(self) -> None:
+        self.engine._retention_lock.acquire()
+        entered = threading.Event()
+
+        def stop_engine() -> None:
+            entered.set()
+            self.engine.stop()
+
+        worker = threading.Thread(target=stop_engine)
+        worker.start()
+        self.assertTrue(entered.wait(1))
+        self.assertTrue(worker.is_alive())
+
+        self.engine._retention_lock.release()
+        worker.join(1)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(
+            self.engine.apply_retention()["status"],
+            "deferred",
+        )
+
     def test_sidecar_delete_failure_still_exposes_deleted_local_placeholder(self) -> None:
         item = self._add_item("sidecar-blocked.mp4", age_days=180, sidecars=True)
         primary = self.engine.archive_root / item["relative_path"]
@@ -190,6 +258,12 @@ class RetentionTests(unittest.TestCase):
         self.assertTrue(thumbnail.exists())
         self.assertIsNone(self.db.get_item(int(item["id"])))
         self.assertTrue(self.db.is_retention_tombstoned(item["source_key"]))
+        self.assertEqual(len(self.db.list_retention_deletion_jobs()), 1)
+
+        SyncEngine(self.db, self.engine.archive_root)
+
+        self.assertFalse(thumbnail.exists())
+        self.assertEqual(self.db.list_retention_deletion_jobs(), [])
 
     def test_storage_limit_deletes_oldest_unprotected_items_by_actual_bytes(self) -> None:
         oldest = self._add_item("oldest.mp4", age_days=3, size=10)

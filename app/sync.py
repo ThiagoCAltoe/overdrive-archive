@@ -32,6 +32,9 @@ from .overdrive import OverdriveClient, OverdriveError
 log = logging.getLogger("overdrive_archive.sync")
 _SAFE_FILENAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$")
 _SAFE_SOURCE_TYPE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,39}$")
+_RETENTION_STAGE = re.compile(
+    r"^\.retention-(?P<item_id>[1-9][0-9]*)-(?P<nonce>[0-9a-f]{24})\.pending$"
+)
 _CONFIG_CONTAINER_KEYS = {
     "appearance",
     "camera",
@@ -263,6 +266,7 @@ class SyncEngine:
         self._retention_lock = threading.Lock()
         self._retention_active = False
         self._last_retention_check = 0.0
+        self._recover_retention_deletions()
 
     def start_scheduler(self) -> None:
         if self._scheduler_thread and self._scheduler_thread.is_alive():
@@ -277,6 +281,13 @@ class SyncEngine:
     def stop(self) -> None:
         self._scheduler_stop.set()
         self.request_stop()
+        scheduler = self._scheduler_thread
+        if scheduler is not None and scheduler is not threading.current_thread():
+            scheduler.join()
+        # Retention moves files and commits a durable journal. Let an active
+        # operation reach a recoverable boundary before the process exits.
+        self._retention_lock.acquire()
+        self._retention_lock.release()
 
     def request_stop(self) -> bool:
         """Request cooperative cancellation without freeing the active slot."""
@@ -451,6 +462,12 @@ class SyncEngine:
         )
 
     def run_once(self, reason: str = "manual") -> dict[str, Any]:
+        recovery_errors = self._recover_retention_deletions()
+        if recovery_errors:
+            log.warning(
+                "Synchronization started with %s pending retention cleanup error(s)",
+                recovery_errors,
+            )
         run_id = self.db.start_run(reason)
         self._set_state(run_id=run_id)
         totals = RunTotals()
@@ -637,18 +654,26 @@ class SyncEngine:
     ) -> dict[str, Any]:
         """Apply local-only age and storage policies without touching the vehicle."""
         with self._state_lock:
-            active_elsewhere = self._active and threading.current_thread() is not self._sync_thread
-        if active_elsewhere or not self._retention_lock.acquire(blocking=False):
+            active_elsewhere = (
+                self._active and threading.current_thread() is not self._sync_thread
+            )
+            shutting_down = self._scheduler_stop.is_set()
+        if (
+            shutting_down
+            or active_elsewhere
+            or not self._retention_lock.acquire(blocking=False)
+        ):
             return {"status": "deferred", "deleted_items": 0, "deleted_bytes": 0}
         with self._state_lock:
             active_elsewhere = (
                 self._active and threading.current_thread() is not self._sync_thread
             )
-            if active_elsewhere:
+            if self._scheduler_stop.is_set() or active_elsewhere:
                 self._retention_lock.release()
                 return {"status": "deferred", "deleted_items": 0, "deleted_bytes": 0}
             self._retention_active = True
         try:
+            recovery_errors = self._recover_retention_deletions()
             settings = settings or self.db.get_settings()
             retention = settings["retention"]
             category_rules = retention["categories"]
@@ -656,7 +681,12 @@ class SyncEngine:
             if not storage_rule["enabled"] and not any(
                 rule["enabled"] for rule in category_rules.values()
             ):
-                return {"status": "disabled", "deleted_items": 0, "deleted_bytes": 0}
+                return {
+                    "status": "partial" if recovery_errors else "disabled",
+                    "deleted_items": 0,
+                    "deleted_bytes": 0,
+                    "error_count": recovery_errors,
+                }
 
             candidates = self.db.list_retention_candidates()
             manually_protected = self.db.list_retention_protected_source_keys()
@@ -684,7 +714,7 @@ class SyncEngine:
             deleted_ids: set[int] = set()
             deleted_items = 0
             deleted_bytes = 0
-            error_count = 0
+            error_count = recovery_errors
 
             for item in candidates:
                 self._check_cancelled()
@@ -778,101 +808,50 @@ class SyncEngine:
                 raise ValueError("Archived path traverses a symbolic link.")
         return root.joinpath(relative)
 
-    def _delete_local_archive_item(
-        self, item: dict[str, Any]
-    ) -> tuple[bool, int, bool]:
-        try:
-            primary = self._retention_safe_path(item.get("relative_path"))
-        except (OSError, TypeError, ValueError):
-            log.error("Retention refused an unsafe archive item path for item %s", item.get("id"))
-            return False, 0, True
-        sidecars: list[Path] = []
-        if item.get("category") == "recordings":
-            partial = primary.with_suffix(primary.suffix + ".part")
-            sidecars.extend(
-                (
-                    primary.with_suffix(".jpg"),
-                    primary.with_suffix(".metadata.json"),
-                    primary.with_suffix(".events.json"),
-                    partial,
-                    partial.with_name(partial.name + ".meta"),
-                )
-            )
+    @staticmethod
+    def _retention_sidecar_paths(primary: Path, category: str) -> list[Path]:
+        if category != "recordings":
+            return []
+        partial = primary.with_suffix(primary.suffix + ".part")
+        return [
+            primary.with_suffix(".jpg"),
+            primary.with_suffix(".metadata.json"),
+            primary.with_suffix(".events.json"),
+            partial,
+            partial.with_name(partial.name + ".meta"),
+        ]
 
-        # Keep the primary recoverable until the inventory-to-tombstone
-        # transaction commits. Otherwise a transient SQLite failure after an
-        # unlink would leave a library row pointing at a missing file.
-        staged_primary: Path | None = None
-        primary_info: os.stat_result | None = None
+    @staticmethod
+    def _path_lstat(path: Path) -> os.stat_result | None:
         try:
-            primary_info = primary.lstat()
+            return path.lstat()
         except FileNotFoundError:
-            pass
-        except OSError:
-            return False, 0, True
-        if primary_info is not None:
-            if stat.S_ISDIR(primary_info.st_mode):
-                return False, 0, True
-            for _ in range(20):
-                candidate = primary.with_name(
-                    f".retention-{int(item['id'])}-{secrets.token_hex(12)}.pending"
-                )
-                try:
-                    candidate.lstat()
-                except FileNotFoundError:
-                    staged_primary = candidate
-                    break
-                except OSError:
-                    return False, 0, True
-            if staged_primary is None:
-                return False, 0, True
-            try:
-                primary.replace(staged_primary)
-            except OSError:
-                return False, 0, True
+            return None
 
-        try:
-            transitioned = self.db.delete_archive_item(int(item["id"]))
-        except Exception:
-            log.exception(
-                "Retention database transition failed for item %s",
-                item.get("id"),
-            )
-            transitioned = False
-        if not transitioned:
-            if staged_primary is not None:
-                try:
-                    primary.lstat()
-                except FileNotFoundError:
-                    try:
-                        staged_primary.replace(primary)
-                    except OSError:
-                        log.exception(
-                            "Retention could not restore staged item %s",
-                            item.get("id"),
-                        )
-                except OSError:
-                    log.exception(
-                        "Retention could not inspect rollback target for item %s",
-                        item.get("id"),
-                    )
-                else:
-                    log.error(
-                        "Retention rollback target already exists for item %s; "
-                        "the staged copy was preserved",
-                        item.get("id"),
-                    )
-            return False, 0, True
+    def _retention_job_paths(
+        self, job: dict[str, Any]
+    ) -> tuple[int, Path, Path]:
+        item_id = int(job["item_id"])
+        if item_id <= 0:
+            raise ValueError("Invalid retention journal item id.")
+        original = self._retention_safe_path(job.get("original_relative_path"))
+        staged = self._retention_safe_path(job.get("staged_relative_path"))
+        match = _RETENTION_STAGE.fullmatch(staged.name)
+        if (
+            staged.parent != original.parent
+            or match is None
+            or int(match.group("item_id")) != item_id
+        ):
+            raise ValueError("Invalid retention staging path.")
+        return item_id, original, staged
 
+    @staticmethod
+    def _unlink_retention_paths(paths: list[Path]) -> tuple[int, bool]:
         freed = 0
         cleanup_ok = True
-        cleanup_paths: list[tuple[Path, os.stat_result | None]] = []
-        if staged_primary is not None:
-            cleanup_paths.append((staged_primary, primary_info))
-        cleanup_paths.extend((path, None) for path in sidecars)
-        for path, known_info in cleanup_paths:
+        for path in paths:
             try:
-                info = known_info or path.lstat()
+                info = path.lstat()
             except FileNotFoundError:
                 continue
             except OSError:
@@ -887,10 +866,177 @@ class SyncEngine:
                     freed += max(0, int(info.st_size))
             except OSError:
                 cleanup_ok = False
+        return freed, cleanup_ok
+
+    def _recover_retention_deletions(self) -> int:
+        """Resolve durable staging jobs left at any prior crash boundary."""
+        try:
+            jobs = self.db.list_retention_deletion_jobs()
+        except Exception:
+            log.exception("Could not read the retention deletion journal")
+            return 1
+        errors = 0
+        for job in jobs:
+            try:
+                item_id, original, staged = self._retention_job_paths(job)
+            except (KeyError, OSError, TypeError, ValueError):
+                log.error(
+                    "Retention refused an invalid deletion journal row for item %s",
+                    job.get("item_id"),
+                )
+                errors += 1
+                continue
+
+            if bool(job.get("inventory_present")):
+                try:
+                    original_info = self._path_lstat(original)
+                    staged_info = self._path_lstat(staged)
+                except OSError:
+                    log.exception(
+                        "Retention could not inspect staged item %s", item_id
+                    )
+                    errors += 1
+                    continue
+                if staged_info is not None:
+                    if stat.S_ISDIR(staged_info.st_mode) or original_info is not None:
+                        log.error(
+                            "Retention preserved conflicting staged files for item %s",
+                            item_id,
+                        )
+                        errors += 1
+                        continue
+                    try:
+                        staged.replace(original)
+                    except OSError:
+                        log.exception(
+                            "Retention could not restore staged item %s", item_id
+                        )
+                        errors += 1
+                        continue
+                try:
+                    finished = self.db.finish_retention_deletion(item_id)
+                except Exception:
+                    log.exception(
+                        "Retention could not finish rollback journal for item %s",
+                        item_id,
+                    )
+                    errors += 1
+                    continue
+                if not finished:
+                    errors += 1
+                continue
+
+            if not bool(job.get("tombstone_present")):
+                log.error(
+                    "Retention preserved an ambiguous deletion journal for item %s",
+                    item_id,
+                )
+                errors += 1
+                continue
+
+            cleanup_paths = [staged, original]
+            cleanup_paths.extend(
+                self._retention_sidecar_paths(
+                    original, str(job.get("category") or "")
+                )
+            )
+            _freed, cleanup_ok = self._unlink_retention_paths(cleanup_paths)
+            if not cleanup_ok:
+                log.warning(
+                    "Retention will retry staged cleanup for item %s", item_id
+                )
+                errors += 1
+                continue
+            try:
+                finished = self.db.finish_retention_deletion(item_id)
+            except Exception:
+                log.exception(
+                    "Retention could not finish cleanup journal for item %s",
+                    item_id,
+                )
+                errors += 1
+                continue
+            if not finished:
+                errors += 1
+        return errors
+
+    def _delete_local_archive_item(
+        self, item: dict[str, Any]
+    ) -> tuple[bool, int, bool]:
+        try:
+            primary = self._retention_safe_path(item.get("relative_path"))
+        except (OSError, TypeError, ValueError):
+            log.error("Retention refused an unsafe archive item path for item %s", item.get("id"))
+            return False, 0, True
+        item_id = int(item["id"])
+        staged_primary: Path | None = None
+        for _ in range(20):
+            candidate = primary.with_name(
+                f".retention-{item_id}-{secrets.token_hex(12)}.pending"
+            )
+            try:
+                if self._path_lstat(candidate) is None:
+                    staged_primary = candidate
+                    break
+            except OSError:
+                return False, 0, True
+        if staged_primary is None:
+            return False, 0, True
+        try:
+            staged_relative = staged_primary.relative_to(
+                self.archive_root.resolve()
+            )
+            journal = self.db.prepare_retention_deletion(
+                item_id, str(staged_relative)
+            )
+        except Exception:
+            log.exception(
+                "Retention could not prepare deletion journal for item %s", item_id
+            )
+            return False, 0, True
+        if journal is None:
+            return False, 0, True
+        try:
+            primary_info = self._path_lstat(primary)
+            if primary_info is not None:
+                if stat.S_ISDIR(primary_info.st_mode):
+                    self._recover_retention_deletions()
+                    return False, 0, True
+                primary.replace(staged_primary)
+        except OSError:
+            self._recover_retention_deletions()
+            return False, 0, True
+        try:
+            transitioned = self.db.delete_archive_item(item_id)
+        except Exception:
+            log.exception(
+                "Retention database transition failed for item %s",
+                item_id,
+            )
+            transitioned = False
+        if not transitioned:
+            self._recover_retention_deletions()
+            return False, 0, True
+        cleanup_paths = [staged_primary]
+        cleanup_paths.extend(
+            self._retention_sidecar_paths(
+                primary, str(item.get("category") or "")
+            )
+        )
+        freed, cleanup_ok = self._unlink_retention_paths(cleanup_paths)
+        if cleanup_ok:
+            try:
+                cleanup_ok = self.db.finish_retention_deletion(item_id)
+            except Exception:
+                log.exception(
+                    "Retention could not finish deletion journal for item %s",
+                    item_id,
+                )
+                cleanup_ok = False
         if not cleanup_ok:
             log.warning(
-                "Retention removed item %s but could not remove every sidecar",
-                item.get("id"),
+                "Retention removed item %s but left recoverable cleanup work",
+                item_id,
             )
         return True, freed, not cleanup_ok
 
@@ -990,6 +1136,7 @@ class SyncEngine:
         multiplier = {"minutes": 60, "hours": 3600, "days": 86400}[rule["unit"]]
         cutoff_ms = int((time.time() - int(rule["value"]) * multiplier) * 1000)
         protected: set[str] = set()
+
         def timestamp_for(row: dict[str, Any]) -> int:
             try:
                 return max(0, int(row["item"].get("timestamp") or 0))
@@ -1021,24 +1168,20 @@ class SyncEngine:
                 result.append(row)
         return result
 
-    def _build_recording_queue_entry(
+    def _recording_archive_path(
         self,
-        client: OverdriveClient,
         settings: dict[str, Any],
         item: dict[str, Any],
         *,
-        identity: str,
         vehicle: str,
-        known_before_run: bool,
-    ) -> RecordingQueueEntry:
+    ) -> tuple[str, str, int, Path, Path]:
+        """Return the validated deterministic destination for one recording."""
         filename = self._safe_filename(item.get("filename"))
         subtype = recording_subtype(item, filename)
         try:
             timestamp_ms = max(0, int(item.get("timestamp") or 0))
-            expected_size = max(0, int(item.get("size") or 0))
         except (TypeError, ValueError) as exc:
             raise OverdriveError("Vehicle returned invalid recording metadata.") from exc
-        source_key = f"{identity}:recording:{filename}:{timestamp_ms}"
         try:
             date = (
                 datetime.fromtimestamp(timestamp_ms / 1000, timezone.utc)
@@ -1057,7 +1200,80 @@ class SyncEngine:
             / f"{date:%d}"
             / filename
         )
+        return (
+            filename,
+            subtype,
+            timestamp_ms,
+            relative,
+            self._safe_archive_path(relative),
+        )
+
+    def _discard_vanished_recording_partial(
+        self,
+        partial_relative_path: Any,
+    ) -> bool:
+        """Remove only resumable artifacts for a vanished vehicle job."""
+        try:
+            relative = Path(str(partial_relative_path or ""))
+            if (
+                len(relative.name) <= len(".part")
+                or not relative.name.endswith(".part")
+            ):
+                raise ValueError("Invalid recording partial path.")
+            partial_path = self._retention_safe_path(relative)
+        except (OSError, TypeError, ValueError):
+            log.warning("Refusing to clean an unsafe vanished recording job")
+            return False
+
+        paths = (
+            partial_path,
+            partial_path.with_name(partial_path.name + ".meta"),
+        )
+        for path in paths:
+            try:
+                info = path.lstat()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return False
+            if stat.S_ISDIR(info.st_mode):
+                return False
+            try:
+                # unlink() removes a symlink itself, never the target it names.
+                path.unlink()
+            except OSError:
+                return False
+        return True
+
+    def _build_recording_queue_entry(
+        self,
+        client: OverdriveClient,
+        settings: dict[str, Any],
+        item: dict[str, Any],
+        *,
+        identity: str,
+        vehicle: str,
+        known_before_run: bool,
+        partial_relative_path: str = "",
+    ) -> RecordingQueueEntry:
+        filename, subtype, timestamp_ms, relative, final_path = (
+            self._recording_archive_path(settings, item, vehicle=vehicle)
+        )
+        try:
+            expected_size = max(0, int(item.get("size") or 0))
+        except (TypeError, ValueError) as exc:
+            raise OverdriveError("Vehicle returned invalid recording metadata.") from exc
+        source_key = f"{identity}:recording:{filename}:{timestamp_ms}"
         existing = self.db.get_item_by_source_key(source_key)
+        if partial_relative_path:
+            stored_partial = self._retention_safe_path(partial_relative_path)
+            if (
+                len(stored_partial.name) <= len(".part")
+                or not stored_partial.name.endswith(".part")
+            ):
+                raise OverdriveError("Stored recording partial path is invalid.")
+            final_path = stored_partial.with_name(stored_partial.name[:-5])
+            relative = final_path.relative_to(self.archive_root.resolve())
         if existing is not None:
             try:
                 existing_relative = Path(str(existing["relative_path"]))
@@ -1065,8 +1281,20 @@ class SyncEngine:
                 relative = existing_relative
             except (KeyError, OSError, TypeError, ValueError):
                 final_path = self._safe_archive_path(relative)
-        else:
-            final_path = self._safe_archive_path(relative)
+        partial_path = final_path.with_suffix(final_path.suffix + ".part")
+        try:
+            effective_partial_relative = str(
+                partial_path.relative_to(self.archive_root.resolve())
+            )
+            path_recorded = self.db.update_recording_download_job_partial_path(
+                source_key, effective_partial_relative
+            )
+        except (OSError, ValueError) as exc:
+            raise OverdriveError(
+                "Could not persist the recording partial path."
+            ) from exc
+        if not path_recorded:
+            raise OverdriveError("Recording queue job disappeared before transfer.")
         final_path.parent.mkdir(parents=True, exist_ok=True)
 
         needs_download = not final_path.is_file()
@@ -1077,7 +1305,6 @@ class SyncEngine:
                 required_size = max(0, int(existing.get("size_bytes") or 0))
             needs_download = bool(required_size and actual_size != required_size)
 
-        partial_path = final_path.with_suffix(final_path.suffix + ".part")
         partial_size = 0
         if needs_download:
             partial_size = OverdriveClient.resumable_size(
@@ -1133,6 +1360,7 @@ class SyncEngine:
             remote_items.append(dict(item))
         self._check_cancelled()
         all_live_jobs: dict[str, dict[str, Any]] = {}
+        all_live_partial_paths: dict[str, str] = {}
         for item in remote_items:
             filename = self._safe_filename(item.get("filename"))
             try:
@@ -1141,6 +1369,13 @@ class SyncEngine:
                 raise OverdriveError("Vehicle returned invalid recording metadata.") from exc
             source_key = f"{identity}:recording:{filename}:{timestamp_ms}"
             all_live_jobs[source_key] = dict(item)
+            _name, _subtype, _timestamp, _relative, final_path = (
+                self._recording_archive_path(settings, item, vehicle=vehicle)
+            )
+            partial_path = final_path.with_suffix(final_path.suffix + ".part")
+            all_live_partial_paths[source_key] = str(
+                partial_path.relative_to(self.archive_root.resolve())
+            )
 
         # Reconcile deleted-local placeholders only after every API page was
         # fetched successfully. A timeout or partial listing never implies that
@@ -1160,13 +1395,45 @@ class SyncEngine:
             ):
                 live_jobs[source_key] = dict(item)
 
-        known_live_keys = self.db.remember_recording_download_jobs(identity, live_jobs)
+        known_live_keys = self.db.remember_recording_download_jobs(
+            identity,
+            live_jobs,
+            {
+                source_key: all_live_partial_paths[source_key]
+                for source_key in live_jobs
+            },
+        )
         new_keys = set(live_jobs) - known_live_keys
+        current_partial_paths = set(all_live_partial_paths.values())
         stored_rows: list[dict[str, Any]] = []
         for stored in self.db.list_recording_download_jobs(identity):
             self._check_cancelled()
             source_key = str(stored["source_key"])
             if source_key not in all_live_jobs:
+                stored_partial = str(stored.get("partial_relative_path") or "")
+                if not stored_partial:
+                    _name, _subtype, _timestamp, _relative, final_path = (
+                        self._recording_archive_path(
+                            settings, stored["item"], vehicle=vehicle
+                        )
+                    )
+                    stored_partial = str(
+                        final_path.with_suffix(final_path.suffix + ".part").relative_to(
+                            self.archive_root.resolve()
+                        )
+                    )
+                # A corrected timestamp can create a new source key that owns
+                # the exact same deterministic partial path.
+                if (
+                    stored_partial not in current_partial_paths
+                    and not self._discard_vanished_recording_partial(stored_partial)
+                ):
+                    log.warning(
+                        "Keeping vanished recording job %s because its resumable "
+                        "artifacts could not be cleaned safely",
+                        source_key,
+                    )
+                    continue
                 self.db.complete_recording_download_job(source_key)
                 continue
             restore_requested = self.db.recording_restore_requested(source_key)
@@ -1194,6 +1461,9 @@ class SyncEngine:
                 identity=identity,
                 vehicle=vehicle,
                 known_before_run=str(stored["source_key"]) not in new_keys,
+                partial_relative_path=str(
+                    stored.get("partial_relative_path") or ""
+                ),
             )
             if entry.source_key != str(stored["source_key"]):
                 raise OverdriveError("Stored recording queue identity is inconsistent.")

@@ -204,10 +204,20 @@ class Database:
                     protected_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS archive_retention_deletion_jobs (
+                    item_id INTEGER PRIMARY KEY,
+                    source_key TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    original_relative_path TEXT NOT NULL,
+                    staged_relative_path TEXT NOT NULL,
+                    prepared_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS recording_download_jobs (
                     source_key TEXT PRIMARY KEY,
                     vehicle_identity TEXT NOT NULL,
                     item_json TEXT NOT NULL,
+                    partial_relative_path TEXT NOT NULL DEFAULT '',
                     first_seen_at TEXT NOT NULL,
                     last_seen_at TEXT NOT NULL
                 );
@@ -312,6 +322,17 @@ class Database:
                         "ALTER TABLE archive_retention_tombstones "
                         f"ADD COLUMN {name} {declaration}"
                     )
+            recording_job_columns = {
+                str(row["name"])
+                for row in conn.execute(
+                    "PRAGMA table_info(recording_download_jobs)"
+                ).fetchall()
+            }
+            if "partial_relative_path" not in recording_job_columns:
+                conn.execute(
+                    "ALTER TABLE recording_download_jobs ADD COLUMN "
+                    "partial_relative_path TEXT NOT NULL DEFAULT ''"
+                )
             self._backfill_retention_tombstones(conn)
             row = conn.execute("SELECT 1 FROM settings WHERE id=1").fetchone()
             if row is None:
@@ -465,6 +486,25 @@ class Database:
         return normalized
 
     @staticmethod
+    def _recording_partial_path(value: Any, *, allow_empty: bool) -> str:
+        if not isinstance(value, str):
+            raise ValueError("Recording partial paths must be text.")
+        if not value and allow_empty:
+            return ""
+        partial = Path(value)
+        if (
+            not value
+            or len(value) > 4096
+            or partial.is_absolute()
+            or ".." in partial.parts
+            or len(partial.name) <= len(".part")
+            or not partial.name.endswith(".part")
+            or any(ord(character) < 32 for character in value)
+        ):
+            raise ValueError("Recording partial path is invalid.")
+        return value
+
+    @staticmethod
     def _canonical_json_metadata(value: Any) -> str:
         if not isinstance(value, (dict, list)):
             raise ValueError("Metadata must be a JSON object or array.")
@@ -504,6 +544,7 @@ class Database:
         self,
         vehicle_identity: str,
         jobs: Mapping[str, dict[str, Any]],
+        partial_relative_paths: Mapping[str, str] | None = None,
     ) -> set[str]:
         """Remember one discovery batch and return keys known before the batch.
 
@@ -515,17 +556,33 @@ class Database:
         )
         if not isinstance(jobs, Mapping):
             raise ValueError("Recording download jobs must be a mapping.")
+        if partial_relative_paths is not None and not isinstance(
+            partial_relative_paths, Mapping
+        ):
+            raise ValueError("Recording partial paths must be a mapping.")
 
-        prepared: list[tuple[str, str]] = []
+        prepared: list[tuple[str, str, str]] = []
         for raw_source_key, item in jobs.items():
             source_key = self._recording_job_identity(raw_source_key, "Source key")
+            partial_value: Any = (
+                partial_relative_paths.get(raw_source_key, "")
+                if partial_relative_paths is not None
+                else ""
+            )
+            partial_value = self._recording_partial_path(
+                partial_value, allow_empty=True
+            )
             prepared.append(
-                (source_key, self._canonical_recording_job_json(item))
+                (
+                    source_key,
+                    self._canonical_recording_job_json(item),
+                    partial_value,
+                )
             )
         if not prepared:
             return set()
 
-        source_keys = {source_key for source_key, _payload in prepared}
+        source_keys = {source_key for source_key, _payload, _path in prepared}
         seen_at = utc_now()
         with self.connect() as conn:
             # The preexisting-key snapshot and every upsert are one atomic
@@ -564,15 +621,21 @@ class Database:
             conn.executemany(
                 """
                 INSERT INTO recording_download_jobs(
-                    source_key,vehicle_identity,item_json,first_seen_at,last_seen_at
-                ) VALUES(?,?,?,?,?)
+                    source_key,vehicle_identity,item_json,partial_relative_path,
+                    first_seen_at,last_seen_at
+                ) VALUES(?,?,?,?,?,?)
                 ON CONFLICT(source_key) DO UPDATE SET
                     item_json=excluded.item_json,
+                    partial_relative_path=CASE
+                        WHEN recording_download_jobs.partial_relative_path=''
+                            THEN excluded.partial_relative_path
+                        ELSE recording_download_jobs.partial_relative_path
+                    END,
                     last_seen_at=excluded.last_seen_at
                 """,
                 (
-                    (source_key, identity, payload, seen_at, seen_at)
-                    for source_key, payload in prepared
+                    (source_key, identity, payload, partial, seen_at, seen_at)
+                    for source_key, payload, partial in prepared
                 ),
             )
         return set(existing)
@@ -586,7 +649,7 @@ class Database:
         with self.connect() as conn:
             rows = conn.execute(
                 """
-                SELECT source_key,vehicle_identity,item_json,
+                SELECT source_key,vehicle_identity,item_json,partial_relative_path,
                        first_seen_at,last_seen_at
                   FROM recording_download_jobs
                  WHERE vehicle_identity=?
@@ -612,11 +675,30 @@ class Database:
                     "source_key": str(row["source_key"]),
                     "vehicle_identity": str(row["vehicle_identity"]),
                     "item": item,
+                    "partial_relative_path": str(row["partial_relative_path"]),
                     "first_seen_at": str(row["first_seen_at"]),
                     "last_seen_at": str(row["last_seen_at"]),
                 }
             )
         return jobs
+
+    def update_recording_download_job_partial_path(
+        self, source_key: str, partial_relative_path: str
+    ) -> bool:
+        normalized = self._recording_job_identity(source_key, "Source key")
+        partial = self._recording_partial_path(
+            partial_relative_path, allow_empty=False
+        )
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE recording_download_jobs
+                   SET partial_relative_path=?
+                 WHERE source_key=?
+                """,
+                (partial, normalized),
+            )
+        return cursor.rowcount == 1
 
     def delete_recording_download_job(self, source_key: str) -> bool:
         normalized = self._recording_job_identity(source_key, "Source key")
@@ -1066,7 +1148,7 @@ class Database:
         return [dict(row) for row in rows]
 
     def delete_archive_item(self, item_id: int) -> bool:
-        """Tombstone and remove one row after caller-managed file cleanup."""
+        """Atomically replace one unprotected inventory row with a tombstone."""
         if isinstance(item_id, bool):
             return False
         try:
@@ -1136,6 +1218,109 @@ class Database:
             )
             cursor = conn.execute(
                 "DELETE FROM archive_items WHERE id=?", (normalized_id,)
+            )
+        return cursor.rowcount == 1
+
+    def prepare_retention_deletion(
+        self,
+        item_id: int,
+        staged_relative_path: str,
+    ) -> dict[str, Any] | None:
+        """Persist a file-staging journal before retention moves any bytes."""
+        if isinstance(item_id, bool):
+            return None
+        try:
+            normalized_id = int(item_id)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not isinstance(staged_relative_path, str):
+            return None
+        staged = Path(staged_relative_path)
+        if (
+            normalized_id <= 0
+            or not staged_relative_path
+            or len(staged_relative_path) > 4096
+            or staged.is_absolute()
+            or ".." in staged.parts
+            or any(ord(character) < 32 for character in staged_relative_path)
+        ):
+            return None
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            item = conn.execute(
+                """
+                SELECT id,source_key,category,relative_path
+                  FROM archive_items AS item
+                 WHERE id=? AND NOT EXISTS (
+                       SELECT 1 FROM archive_retention_protections AS protection
+                        WHERE protection.source_key=item.source_key
+                 )
+                """,
+                (normalized_id,),
+            ).fetchone()
+            if item is None:
+                return None
+            cursor = conn.execute(
+                """
+                INSERT OR IGNORE INTO archive_retention_deletion_jobs(
+                    item_id,source_key,category,original_relative_path,
+                    staged_relative_path,prepared_at
+                ) VALUES(?,?,?,?,?,?)
+                """,
+                (
+                    normalized_id,
+                    str(item["source_key"]),
+                    str(item["category"]),
+                    str(item["relative_path"]),
+                    staged_relative_path,
+                    utc_now(),
+                ),
+            )
+            if cursor.rowcount != 1:
+                return None
+        return {
+            "item_id": normalized_id,
+            "source_key": str(item["source_key"]),
+            "category": str(item["category"]),
+            "original_relative_path": str(item["relative_path"]),
+            "staged_relative_path": staged_relative_path,
+        }
+
+    def list_retention_deletion_jobs(self) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT job.item_id,job.source_key,job.category,
+                       job.original_relative_path,
+                       job.staged_relative_path,job.prepared_at,
+                       EXISTS(
+                           SELECT 1 FROM archive_items AS item
+                            WHERE item.id=job.item_id
+                              AND item.source_key=job.source_key
+                       ) AS inventory_present,
+                       EXISTS(
+                           SELECT 1 FROM archive_retention_tombstones AS tombstone
+                            WHERE tombstone.source_key=job.source_key
+                       ) AS tombstone_present
+                  FROM archive_retention_deletion_jobs AS job
+                 ORDER BY job.item_id
+                """
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def finish_retention_deletion(self, item_id: int) -> bool:
+        if isinstance(item_id, bool):
+            return False
+        try:
+            normalized_id = int(item_id)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if normalized_id <= 0:
+            return False
+        with self.connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM archive_retention_deletion_jobs WHERE item_id=?",
+                (normalized_id,),
             )
         return cursor.rowcount == 1
 

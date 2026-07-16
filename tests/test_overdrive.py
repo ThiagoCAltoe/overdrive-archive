@@ -167,6 +167,36 @@ class OverdriveClientTests(unittest.TestCase):
         self.assertEqual(size, 6)
         self.assertEqual(digest, hashlib.sha256(b"abcdef").hexdigest())
 
+    def test_unknown_expected_size_accepts_a_complete_valid_part(self) -> None:
+        destination = Path(self.temp.name) / "recording.mp4.part"
+        destination.write_bytes(b"abcdef")
+        self.client._write_partial_metadata(
+            self.client._partial_metadata_path(destination),
+            source_identity="vehicle:recording:synthetic",
+            expected_size=0,
+            total_size=6,
+            validator=("etag", '"stable"'),
+        )
+        self.client._open = Mock(
+            side_effect=AssertionError("a complete part must not request Range at EOF")
+        )
+        progress = []
+
+        size, digest = self.client.download_to(
+            "/video/synthetic.mp4",
+            destination,
+            max_bytes=6,
+            expected_size=0,
+            source_identity="vehicle:recording:synthetic",
+            resume=True,
+            progress_callback=lambda done, total: progress.append((done, total)),
+        )
+
+        self.client._open.assert_not_called()
+        self.assertEqual(progress, [(6, 6)])
+        self.assertEqual(size, 6)
+        self.assertEqual(digest, hashlib.sha256(b"abcdef").hexdigest())
+
     def test_resume_rejects_remote_total_above_reduced_limit_before_reading(self) -> None:
         class TrackingResponse(DownloadResponse):
             read_calls = 0

@@ -91,6 +91,42 @@ class RecordingDownloadJobTests(unittest.TestCase):
             Path(self.temporary.name) / "archive.sqlite3"
         )
 
+    def test_legacy_jobs_gain_a_durable_partial_path_column(self) -> None:
+        path = Path(self.temporary.name) / "legacy-jobs.sqlite3"
+        with sqlite3.connect(path) as conn:
+            conn.execute(
+                """
+                CREATE TABLE recording_download_jobs (
+                    source_key TEXT PRIMARY KEY,
+                    vehicle_identity TEXT NOT NULL,
+                    item_json TEXT NOT NULL,
+                    first_seen_at TEXT NOT NULL,
+                    last_seen_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO recording_download_jobs(
+                    source_key,vehicle_identity,item_json,
+                    first_seen_at,last_seen_at
+                ) VALUES(?,?,?,?,?)
+                """,
+                (
+                    "legacy-source",
+                    "vehicle-one",
+                    '{"filename":"legacy.mp4"}',
+                    "2026-07-16T10:00:00+00:00",
+                    "2026-07-16T10:00:00+00:00",
+                ),
+            )
+
+        migrated = Database(path)
+
+        jobs = migrated.list_recording_download_jobs("vehicle-one")
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]["partial_relative_path"], "")
+
     def test_batch_remember_is_canonical_and_reports_preexisting_keys(self) -> None:
         with patch("app.db.utc_now", return_value="2026-07-16T13:00:00+00:00"):
             known = self.database.remember_recording_download_jobs(
@@ -99,17 +135,25 @@ class RecordingDownloadJobTests(unittest.TestCase):
                     "source-b": {"z": 1, "name": "câmera"},
                     "source-a": {"nested": {"b": 2, "a": 1}},
                 },
+                {
+                    "source-b": "vehicles/one/source-b.mp4.part",
+                    "source-a": "vehicles/one/source-a.mp4.part",
+                },
             )
         self.assertEqual(known, set())
 
         with self.database.connect() as conn:
             row = conn.execute(
                 """
-                SELECT item_json,first_seen_at,last_seen_at
+                SELECT item_json,partial_relative_path,first_seen_at,last_seen_at
                   FROM recording_download_jobs WHERE source_key='source-b'
                 """
             ).fetchone()
         self.assertEqual(row["item_json"], '{"name":"câmera","z":1}')
+        self.assertEqual(
+            row["partial_relative_path"],
+            "vehicles/one/source-b.mp4.part",
+        )
         self.assertEqual(row["first_seen_at"], "2026-07-16T13:00:00+00:00")
         self.assertEqual(row["last_seen_at"], "2026-07-16T13:00:00+00:00")
 
@@ -120,6 +164,10 @@ class RecordingDownloadJobTests(unittest.TestCase):
                     "source-b": {"z": 2},
                     "source-c": {"z": 3},
                 },
+                {
+                    "source-b": "vehicles/changed/source-b.mp4.part",
+                    "source-c": "vehicles/one/source-c.mp4.part",
+                },
             )
         self.assertEqual(known, {"source-b"})
 
@@ -128,12 +176,17 @@ class RecordingDownloadJobTests(unittest.TestCase):
                 row["source_key"]: dict(row)
                 for row in conn.execute(
                     """
-                    SELECT source_key,item_json,first_seen_at,last_seen_at
+                    SELECT source_key,item_json,partial_relative_path,
+                           first_seen_at,last_seen_at
                       FROM recording_download_jobs
                     """
                 )
             }
         self.assertEqual(rows["source-b"]["item_json"], '{"z":2}')
+        self.assertEqual(
+            rows["source-b"]["partial_relative_path"],
+            "vehicles/one/source-b.mp4.part",
+        )
         self.assertEqual(
             rows["source-b"]["first_seen_at"],
             "2026-07-16T13:00:00+00:00",
@@ -145,6 +198,39 @@ class RecordingDownloadJobTests(unittest.TestCase):
         self.assertEqual(
             rows["source-c"]["first_seen_at"],
             "2026-07-16T14:00:00+00:00",
+        )
+
+    def test_recording_partial_path_rejects_traversal(self) -> None:
+        with self.assertRaisesRegex(ValueError, "partial path"):
+            self.database.remember_recording_download_jobs(
+                "vehicle-one",
+                {"source": {"filename": "source.mp4"}},
+                {"source": "../outside.mp4.part"},
+            )
+
+        self.assertEqual(
+            self.database.list_recording_download_jobs("vehicle-one"), []
+        )
+
+    def test_effective_recording_partial_path_can_be_corrected_before_transfer(
+        self,
+    ) -> None:
+        self.database.remember_recording_download_jobs(
+            "vehicle-one",
+            {"source": {"filename": "source.mp4"}},
+            {"source": "vehicles/new/source.mp4.part"},
+        )
+
+        self.assertTrue(
+            self.database.update_recording_download_job_partial_path(
+                "source", "vehicles/inventory/source.mp4.part"
+            )
+        )
+
+        jobs = self.database.list_recording_download_jobs("vehicle-one")
+        self.assertEqual(
+            jobs[0]["partial_relative_path"],
+            "vehicles/inventory/source.mp4.part",
         )
 
     def test_list_is_vehicle_scoped_and_returns_decoded_items(self) -> None:
@@ -369,6 +455,61 @@ class RetentionDatabaseTests(unittest.TestCase):
                 "SELECT count(*) FROM archive_retention_tombstones"
             ).fetchone()[0]
         self.assertEqual(count, 0)
+
+    def test_retention_deletion_journal_survives_inventory_transition(self) -> None:
+        item_id = self.add_item("journal-source")
+        staged = "vehicles/vehicle-one/.retention-1-test.pending"
+
+        prepared = self.database.prepare_retention_deletion(item_id, staged)
+
+        self.assertIsNotNone(prepared)
+        self.assertEqual(prepared["source_key"], "journal-source")
+        self.assertEqual(prepared["staged_relative_path"], staged)
+        self.assertIsNone(
+            self.database.prepare_retention_deletion(item_id, staged)
+        )
+        before = self.database.list_retention_deletion_jobs()
+        self.assertEqual(len(before), 1)
+        self.assertTrue(before[0]["inventory_present"])
+        self.assertFalse(before[0]["tombstone_present"])
+
+        self.assertTrue(self.database.delete_archive_item(item_id))
+
+        after = self.database.list_retention_deletion_jobs()
+        self.assertEqual(len(after), 1)
+        self.assertFalse(after[0]["inventory_present"])
+        self.assertTrue(after[0]["tombstone_present"])
+        self.assertTrue(self.database.finish_retention_deletion(item_id))
+        self.assertFalse(self.database.finish_retention_deletion(item_id))
+        self.assertEqual(self.database.list_retention_deletion_jobs(), [])
+
+    def test_retention_deletion_journal_rejects_unsafe_or_protected_items(self) -> None:
+        item_id = self.add_item("protected-journal")
+        with self.database.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO archive_retention_protections(
+                    source_key,category,protected_at
+                ) VALUES(?,?,?)
+                """,
+                (
+                    "protected-journal",
+                    "recordings",
+                    "2026-07-16T18:00:00+00:00",
+                ),
+            )
+
+        self.assertIsNone(
+            self.database.prepare_retention_deletion(
+                item_id, "../outside.pending"
+            )
+        )
+        self.assertIsNone(
+            self.database.prepare_retention_deletion(
+                item_id, "vehicles/.retention-safe.pending"
+            )
+        )
+        self.assertEqual(self.database.list_retention_deletion_jobs(), [])
 
 
 class RestorableRetentionDatabaseTests(unittest.TestCase):
